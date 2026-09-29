@@ -1,3 +1,5 @@
+<img width="512" height="512" alt="app_icon" src="https://github.com/user-attachments/assets/46704c69-25f3-4c66-bea0-189794a81ed0" />
+
 # YouTube Media Downloader v2.0.0-alpha19 — Python / PySide6
 
 Первая кроссплатформенная миграция PowerShell/WinForms-версии.
