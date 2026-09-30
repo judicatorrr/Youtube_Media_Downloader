@@ -1,6 +1,6 @@
 #!/bin/bash
 set -e
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/../Files"
 
 MIN_MINOR=11
 PYTHON_VERSION="3.12.10"

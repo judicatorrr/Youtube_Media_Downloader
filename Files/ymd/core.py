@@ -569,6 +569,40 @@ class AudioFormat:
     size: float
     is_drc: bool
     label: str
+    language: str = ""
+    is_original: bool = False
+    language_preference: float = 0.0
+    is_dubbed: bool = False
+
+
+def audio_preference_key(fmt: AudioFormat):
+    return (not fmt.is_original, fmt.is_dubbed, fmt.is_drc, -fmt.abr, -fmt.language_preference)
+
+
+def audio_display_label(fmt: AudioFormat, lang: str = "RU") -> str:
+    details = [fmt.label]
+    if fmt.language:
+        details.append(fmt.language)
+    if fmt.is_original:
+        details.append("Оригинал" if lang == "RU" else "Original")
+    elif fmt.is_dubbed:
+        details.append("Дубляж" if lang == "RU" else "Dubbed")
+    return " • ".join(details)
+
+
+def video_container_compatible(fmt, container: str) -> bool:
+    return fmt.codec in ({"H.264", "AV1"} if container == "MP4" else {"VP9", "AV1"} if container == "WebM" else {"H.264", "VP9", "AV1"})
+
+
+def audio_container_compatible(fmt, container: str) -> bool:
+    return fmt.codec in ({"AAC"} if container == "MP4" else {"Opus"} if container == "WebM" else {"AAC", "Opus"})
+
+
+def container_has_4k(videos, audios, container: str) -> bool:
+    return any(audio_container_compatible(a, container) for a in audios) and any(
+        video_container_compatible(v, container) and (min(v.width, v.height) if v.width and v.height else v.height) >= 2160
+        for v in videos
+    )
 
 
 @dataclass
@@ -641,7 +675,11 @@ def parse_formats(info: dict) -> tuple[list[AudioFormat], list[VideoFormat]]:
                 f"{audio_size_text} • {ext.upper()}{drc}"
             )
             audio.append(
-                AudioFormat(fid, codec, acodec, ext, abr, asr, audio_size_value, is_drc, label)
+                AudioFormat(fid, codec, acodec, ext, abr, asr, audio_size_value, is_drc, label,
+                            str(f.get("language") or ""),
+                            "original" in note.lower() or float(f.get("language_preference") or 0) >= 10,
+                            float(f.get("language_preference") or 0),
+                            bool(re.search(r"dubbed|dub|дубляж|auto.translat", note, re.I)))
             )
             continue
 
@@ -665,7 +703,13 @@ def parse_formats(info: dict) -> tuple[list[AudioFormat], list[VideoFormat]]:
                 )
             )
 
-    audio.sort(key=lambda x: (x.is_drc, -x.abr))
+    original_languages = {a.language for a in audio if a.is_original and a.language}
+    for a in audio:
+        if a.language and a.language in original_languages:
+            a.is_original = True
+        if original_languages and a.language and a.language not in original_languages:
+            a.is_dubbed = True
+    audio.sort(key=audio_preference_key)
     video.sort(key=lambda x: (x.codec, -x.height, -x.fps, -x.tbr))
     return audio, video
 

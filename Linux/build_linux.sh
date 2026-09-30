@@ -1,6 +1,6 @@
 #!/bin/bash
 set -e
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/../Files"
 
 python_ok() {
   local exe="$1"
@@ -35,7 +35,7 @@ source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install -r requirements.txt
 python -m pip install -r requirements-build.txt
-python build_app.py --onefile
+python build_app.py
 
 echo
-echo "Build is in the dist folder."
+echo "Build is in the Files/dist folder."

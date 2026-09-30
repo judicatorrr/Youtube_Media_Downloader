@@ -10,12 +10,13 @@ import sys
 import tempfile
 import urllib.request
 import time
+import random
 from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
-from PySide6.QtGui import QDesktopServices, QPalette, QColor, QStandardItemModel, QStandardItem, QPixmap
-from PySide6.QtCore import QUrl
+from PySide6.QtGui import QDesktopServices, QPalette, QColor, QStandardItemModel, QStandardItem, QPixmap, QIcon, QPainter, QImage
+from PySide6.QtCore import QUrl, QSize, QEvent
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -27,6 +28,8 @@ from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
     QGroupBox,
+    QStyle,
+    QStyleOptionGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
@@ -42,13 +45,14 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QSpacerItem,
     QToolButton,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
 
 from . import APP_NAME, APP_VERSION
 from .auth import BROWSERS, cookie_args, is_youtube_bot_error, bot_error_help
-from .dependencies import install_dependency, check_dependency_updates
+from .dependencies import install_dependency, check_dependency_updates, _ssl_context
 
 from .skins import SKIN_ORDER, get_skin
 
@@ -63,6 +67,11 @@ from .chapters import (
 )
 from .core import (
     AudioFormat,
+    audio_preference_key,
+    audio_display_label,
+    video_container_compatible,
+    audio_container_compatible,
+    container_has_4k,
     CaptureWorker,
     clear_tool_cache,
     certificate_process_env,
@@ -207,6 +216,34 @@ class ChevronComboBox(QComboBox):
 
 
 
+def help_indicator(target, parent=None):
+    button = QToolButton(parent)
+    button.setText("i")
+    button.setObjectName("helpIndicator")
+    button.setFixedSize(18, 18)
+    button.setCursor(Qt.PointingHandCursor)
+    button.clicked.connect(lambda: QToolTip.showText(button.mapToGlobal(button.rect().bottomLeft()), target.toolTip(), button, button.rect(), 9000))
+    button.help_target = target
+    return button
+
+
+def attach_label_help(label, target):
+    parent = label.parentWidget()
+    box = QWidget(parent)
+    row = QHBoxLayout(box)
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(4)
+    old_item = parent.layout().replaceWidget(label, box, Qt.FindChildrenRecursively)
+    if old_item is None:
+        box.deleteLater()
+        return None
+    row.addWidget(label)
+    button = help_indicator(target, box)
+    row.addWidget(button)
+    row.addStretch(1)
+    return button
+
+
 class OverallProgressBar(QProgressBar):
     """Progress bar with centered percent and an inset speed readout on the left."""
     def __init__(self, parent=None):
@@ -300,6 +337,27 @@ class CollapsibleGroup(QGroupBox):
         # behind the glyph so it reads as part of the section caption.
         self.collapse_button.setGeometry(9, 3, 26, 22)
         self.collapse_button.raise_()
+        self.position_section_help()
+
+    def position_section_help(self):
+        if not hasattr(self, "section_help"):
+            return
+        option = QStyleOptionGroupBox()
+        self.initStyleOption(option)
+        title_rect = self.style().subControlRect(QStyle.CC_GroupBox, option, QStyle.SC_GroupBoxLabel, self)
+        x = min(title_rect.right() + 8, self.width() - self.section_help.width() - 6)
+        y = max(0, title_rect.center().y() - self.section_help.height() // 2)
+        self.section_help.move(x, y)
+        self.section_help.raise_()
+
+    def setTitle(self, title):
+        super().setTitle(title)
+        self.position_section_help()
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() in (QEvent.StyleChange, QEvent.FontChange):
+            self.position_section_help()
 
     def _set_layout_visible(self, layout, visible: bool):
         if layout is None:
@@ -336,30 +394,58 @@ class PreviewWorker(QThread):
     loaded = Signal(bytes)
     failed = Signal(str)
 
-    def __init__(self, url: str, proxy: str = ""):
-        super().__init__()
-        self.url = url
+    def __init__(self, urls, proxy: str = "", certificate_mode: str = "Auto", parent=None):
+        super().__init__(parent)
+        self.urls = [urls] if isinstance(urls, str) else list(urls)
         self.proxy = proxy
+        self.certificate_mode = certificate_mode
 
     def run(self):
-        try:
-            if self.proxy.lower().startswith(("http://", "https://")):
-                opener = urllib.request.build_opener(
-                    urllib.request.ProxyHandler({"http": self.proxy, "https": self.proxy})
-                )
-            else:
-                opener = urllib.request.build_opener()
-            request = urllib.request.Request(
-                self.url,
-                headers={"User-Agent": "YouTube-Media-Downloader/2"},
-            )
-            with opener.open(request, timeout=12) as response:
-                data = response.read(6 * 1024 * 1024)
-            if not data:
-                raise RuntimeError("empty thumbnail")
-            self.loaded.emit(data)
-        except Exception as exc:
-            self.failed.emit(str(exc))
+        errors = []
+        for url in self.urls[:3]:
+            if self.isInterruptionRequested():
+                return
+            try:
+                if self.proxy.lower().startswith(("socks4", "socks5")):
+                    curl = shutil.which("curl")
+                    if not curl:
+                        raise RuntimeError("SOCKS preview requires curl")
+                    cmd = [curl, "--silent", "--show-error", "--fail", "--location", "--max-time", "12", "--proxy", self.proxy]
+                    if self.certificate_mode == "Insecure":
+                        cmd.append("--insecure")
+                    else:
+                        ca_file = certificate_process_env(self.certificate_mode).get("SSL_CERT_FILE")
+                        if self.certificate_mode == "Certifi":
+                            import certifi
+                            ca_file = certifi.where()
+                        if ca_file:
+                            cmd += ["--cacert", ca_file]
+                    result = subprocess.run(cmd + [url], capture_output=True, timeout=15)
+                    if result.returncode:
+                        raise RuntimeError(result.stderr.decode("utf-8", "replace")[-300:])
+                    data = result.stdout
+                else:
+                    # An explicit empty proxy map respects Direct/TUN instead of
+                    # accidentally inheriting proxy variables from the OS.
+                    proxies = {"http": self.proxy, "https": self.proxy} if self.proxy else {}
+                    opener = urllib.request.build_opener(
+                        urllib.request.ProxyHandler(proxies),
+                        urllib.request.HTTPSHandler(context=_ssl_context(self.certificate_mode)),
+                    )
+                    request = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0", "Accept": "image/jpeg,image/webp,image/*"})
+                    with opener.open(request, timeout=12) as response:
+                        data = response.read(6 * 1024 * 1024 + 1)
+                if not data or len(data) > 6 * 1024 * 1024:
+                    raise RuntimeError("empty or oversized thumbnail")
+                if QImage.fromData(data).isNull():
+                    raise RuntimeError("thumbnail is not a supported image")
+                if not self.isInterruptionRequested():
+                    self.loaded.emit(data)
+                return
+            except Exception as exc:
+                errors.append(str(exc))
+        if not self.isInterruptionRequested():
+            self.failed.emit("; ".join(errors)[-800:])
 
 
 class RemuxDropArea(QFrame):
@@ -567,15 +653,56 @@ class ManualChaptersDialog(QDialog):
         layout.addLayout(buttons)
 
 
+class OstrovEqualizer(QWidget):
+    """Small silent animation, active only while the easter egg is visible."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedHeight(76)
+        self.levels = [0.2] * 24
+        self.timer = QTimer(self)
+        self.timer.setInterval(100)
+        self.timer.timeout.connect(self.tick)
+
+    def tick(self):
+        self.levels = [random.uniform(0.12, 1.0) for _ in self.levels]
+        self.update()
+
+    def showEvent(self, event):
+        self.timer.start()
+        super().showEvent(event)
+
+    def hideEvent(self, event):
+        self.timer.stop()
+        super().hideEvent(event)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.fillRect(self.rect(), QColor("#090e0b"))
+        step = self.width() / len(self.levels)
+        for i, level in enumerate(self.levels):
+            count = max(1, int(level * 12))
+            for row in range(count):
+                painter.fillRect(int(i * step + 2), self.height() - 5 - row * 5,
+                                 max(2, int(step - 4)), 3,
+                                 QColor("#ffb43b" if row > 8 else "#a4ff36" if row > 5 else "#3cd75f"))
+
+
 class NetworkDialog(QDialog):
     def __init__(self, parent, settings: dict):
         super().__init__(parent)
         self.settings = settings
         self.setWindowTitle("Подключение к YouTube")
-        self.resize(660, 760)
+        self.resize(700, 810)
 
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Как yt-dlp должен выходить в интернет?"))
+        self.lang = getattr(parent, "lang", "RU")
+        self.question = QLabel("Как yt-dlp должен выходить в интернет?" if self.lang == "RU" else "How should yt-dlp connect to the internet?")
+        self.question.setObjectName("networkQuestion")
+        self.question.setWordWrap(True)
+        layout.addWidget(self.question)
+        self.route_title = QLabel("МАРШРУТ ПОДКЛЮЧЕНИЯ" if self.lang == "RU" else "CONNECTION ROUTE")
+        self.route_title.setObjectName("networkSection")
+        layout.addWidget(self.route_title)
 
         system_proxy = get_system_proxy()
         detected = (
@@ -612,7 +739,7 @@ class NetworkDialog(QDialog):
         layout.addWidget(self.proxy_edit)
 
         cert_title = QLabel("HTTPS-сертификаты")
-        cert_title.setStyleSheet("font-weight: 650;")
+        cert_title.setObjectName("networkSection")
         layout.addWidget(cert_title)
 
         self.cert_mode = ChevronComboBox()
@@ -640,7 +767,7 @@ class NetworkDialog(QDialog):
         lang = getattr(parent, "lang", "RU")
         en = lang == "EN"
         cookies_title = QLabel("YouTube cookies (optional)" if en else "Cookies YouTube (по необходимости)")
-        cookies_title.setStyleSheet("font-weight: 650;")
+        cookies_title.setObjectName("networkSection")
         layout.addWidget(cookies_title)
         self.cookies_mode = ChevronComboBox()
         for label, value in [("Disabled" if en else "Не использовать", "None"),
@@ -653,7 +780,7 @@ class NetworkDialog(QDialog):
         self.cookies_browser = ChevronComboBox()
         for browser in BROWSERS:
             if browser != "safari" or platform.system() == "Darwin":
-                self.cookies_browser.addItem(browser.capitalize(), browser)
+                self.cookies_browser.addItem(("Яндекс Браузер (cookies.txt)" if not en else "Yandex Browser (cookies.txt)") if browser == "yandex" else browser.capitalize(), browser)
         idx = self.cookies_browser.findData(settings.get("cookies_browser", "chrome"))
         self.cookies_browser.setCurrentIndex(max(0, idx))
         layout.addWidget(self.cookies_browser)
@@ -673,6 +800,7 @@ class NetworkDialog(QDialog):
         cookie_hint.setWordWrap(True)
         cookie_hint.setProperty("muted", True)
         layout.addWidget(cookie_hint)
+        self.cookies_browser.currentIndexChanged.connect(self.update_cookie_state)
         self.cookies_mode.currentIndexChanged.connect(self.update_cookie_state)
         self.update_cookie_state()
 
@@ -684,13 +812,18 @@ class NetworkDialog(QDialog):
         else:
             self.auto.setChecked(True)
 
+        result_title = QLabel("РЕЗУЛЬТАТ ПРОВЕРКИ" if self.lang == "RU" else "TEST RESULT")
+        result_title.setObjectName("networkSection")
+        layout.addWidget(result_title)
         self.result = QPlainTextEdit()
+        self.result.setObjectName("networkResult")
         self.result.setReadOnly(True)
         self.result.setMaximumHeight(90)
         layout.addWidget(self.result)
 
         buttons = QHBoxLayout()
         self.test_btn = QPushButton("Проверить соединение")
+        self.test_btn.setObjectName("primaryButton")
         ok = QPushButton("Продолжить")
         cancel = QPushButton("Отмена")
         self.test_btn.clicked.connect(self.test_connection)
@@ -702,6 +835,20 @@ class NetworkDialog(QDialog):
         buttons.addWidget(cancel)
         layout.addLayout(buttons)
 
+        self.network_help_buttons = []
+        for label, target, russian, english in (
+            (self.route_title, self.proxy_edit, "Auto берёт системный proxy; Direct/TUN работает без явного proxy.", "Auto uses the system proxy; Direct/TUN uses no explicit proxy."),
+            (cert_title, self.cert_mode, "Auto: macOS Keychain, Windows certifi, Linux системные CA. Отключение проверки снижает безопасность.", "Auto: macOS Keychain, Windows certifi, Linux system CA. Disabling verification reduces security."),
+            (cookies_title, self.cookies_mode, "Cookies нужны при проверке YouTube или доступе по аккаунту. Яндекс — через cookies.txt.", "Cookies help with YouTube verification or account access. Yandex requires cookies.txt."),
+            (result_title, self.result, "Результат проверки выбранного маршрута; ошибки показывают причину.", "Result for the selected route; errors explain the cause."),
+        ):
+            target.setToolTip(russian if self.lang == "RU" else english)
+            button = attach_label_help(label, target)
+            if button:
+                button.setToolTip(target.toolTip())
+                self.network_help_buttons.append(button)
+        self.cookies_browser.setToolTip("Выбери браузер с открытой сессией YouTube." if self.lang == "RU" else "Choose the browser with your YouTube session.")
+        self.cookies_file.setToolTip("Экспортированный файл cookies в формате Netscape." if self.lang == "RU" else "An exported Netscape cookie file.")
         self.worker: Optional[CaptureWorker] = None
         self.update_manual_state()
         for button in self.group.buttons():
@@ -715,8 +862,9 @@ class NetworkDialog(QDialog):
     def update_cookie_state(self, *_):
         mode = self.cookies_mode.currentData()
         self.cookies_browser.setEnabled(mode == "Browser")
-        self.cookies_file.setEnabled(mode == "File")
-        self.cookies_browse.setEnabled(mode == "File")
+        use_file = mode == "File" or (mode == "Browser" and self.cookies_browser.currentData() == "yandex")
+        self.cookies_file.setEnabled(use_file)
+        self.cookies_browse.setEnabled(use_file)
 
     def browse_cookies(self):
         path, _ = QFileDialog.getOpenFileName(self, "cookies.txt", self.cookies_file.text(), "Cookies (*.txt);;All files (*)")
@@ -1455,6 +1603,8 @@ class MainWindow(QMainWindow):
         self.post_worker: Optional[PostProcessWorker] = None
         self.network_worker: Optional[NetworkWorker] = None
         self.preview_worker: Optional[PreviewWorker] = None
+        self.preview_workers = []
+        self.preview_generation = 0
         self.dependency_status_worker: Optional[DependencyStatusWorker] = None
         self.session_certificate_override: Optional[str] = None
         self.pending_ssl_retry_url: Optional[str] = None
@@ -1494,8 +1644,15 @@ class MainWindow(QMainWindow):
         # HEADER: compact toolbar based on the supplied mockup.
         header = QFrame()
         header.setObjectName("appHeader")
-        header_layout = QHBoxLayout(header)
-        header_layout.setContentsMargins(10, 7, 10, 7)
+        header_outer = QVBoxLayout(header)
+        header_outer.setContentsMargins(10, 7, 10, 7)
+        header_outer.setSpacing(5)
+        header_layout = QHBoxLayout()
+        header_outer.addLayout(header_layout)
+        controls_row = QHBoxLayout()
+        controls_row.setSpacing(9)
+        header_outer.addLayout(controls_row)
+        header_layout.setContentsMargins(0, 0, 0, 0)
         header_layout.setSpacing(9)
 
         title_box = QVBoxLayout()
@@ -1504,13 +1661,14 @@ class MainWindow(QMainWindow):
         self.title.setObjectName("title")
         self.subtitle = QLabel("")
         self.subtitle.setProperty("muted", True)
+        self.subtitle.setWordWrap(True)
         title_box.addWidget(self.title)
         title_box.addWidget(self.subtitle)
         header_layout.addLayout(title_box, 1)
 
         self.deps_header_btn = QPushButton()
         self.deps_header_btn.setObjectName("headerButton")
-        self.deps_header_btn.setMinimumWidth(230)
+        self.deps_header_btn.setMinimumWidth(190)
         self.deps_header_btn.clicked.connect(self.check_ffmpeg)
 
         self.language_title = QLabel("Language:")
@@ -1529,12 +1687,31 @@ class MainWindow(QMainWindow):
         self.skin_combo.setMinimumWidth(160)
         self.skin_combo.currentTextChanged.connect(self.change_skin)
 
-        header_layout.addWidget(self.deps_header_btn)
-        header_layout.addSpacing(5)
-        header_layout.addWidget(self.language_title)
-        header_layout.addWidget(self.language)
-        header_layout.addWidget(self.skin_label)
-        header_layout.addWidget(self.skin_combo)
+        self.connection_btn = QPushButton()
+        self.connection_btn.setObjectName("headerButton")
+        self.connection_btn.setIcon(QIcon(str(Path(getattr(sys, "_MEIPASS", app_dir())) / "resources" / "network_settings.svg")))
+        self.connection_btn.setIconSize(QSize(20, 20))
+        self.connection_btn.clicked.connect(self.show_network_settings)
+        self.info_btn = QToolButton()
+        self.info_btn.setText("?")
+        self.info_btn.setStyleSheet("padding: 2px; font-size: 16px; font-weight: 700;")
+        self.info_btn.setFixedSize(30, 30)
+        self.info_btn.clicked.connect(self.show_app_info)
+        self.deps_header_btn.setMinimumWidth(0)
+        self.language.setMinimumWidth(58)
+        self.skin_combo.setMinimumWidth(128)
+        self.skin_combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.skin_combo.setMinimumContentsLength(12)
+        self.skin_combo.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
+        controls_row.setSpacing(6)
+        controls_row.addStretch(1)
+        controls_row.addWidget(self.deps_header_btn)
+        controls_row.addWidget(self.connection_btn)
+        controls_row.addWidget(self.language_title)
+        controls_row.addWidget(self.language)
+        controls_row.addWidget(self.skin_label)
+        controls_row.addWidget(self.skin_combo)
+        controls_row.addWidget(self.info_btn)
         root.addWidget(header)
 
         # Shared source / analysis card. Output folder sits opposite the URL.
@@ -1630,14 +1807,36 @@ class MainWindow(QMainWindow):
         self.audio_stream_label = QLabel()
         self.audio_stream_label.setObjectName("keyLabel")
         a.addWidget(self.audio_stream_label)
+        self.audio_track_combo = ChevronComboBox()
+        self.audio_track_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.audio_track_combo.setMinimumWidth(150)
+        self.audio_track_combo.currentIndexChanged.connect(self.update_audio_containers)
+        a.addWidget(self.audio_track_combo)
+        audio_labels = QHBoxLayout()
+        self.audio_format_label = QLabel()
+        self.audio_variant_label = QLabel()
+        audio_labels.addWidget(self.audio_format_label, 2)
+        audio_labels.addWidget(self.audio_variant_label, 5)
+        a.addLayout(audio_labels)
+        audio_row = QHBoxLayout()
+        self.audio_container_combo = ChevronComboBox()
+        self.audio_container_combo.setMinimumWidth(92)
+        self.audio_container_combo.currentIndexChanged.connect(self.update_audio_variants)
         self.audio_combo = ChevronComboBox()
+        self.audio_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.audio_combo.setMinimumWidth(150)
         self.audio_combo.currentIndexChanged.connect(self.audio_selection_changed)
-        a.addWidget(self.audio_combo)
+        audio_row.addWidget(self.audio_container_combo, 2)
+        audio_row.addWidget(self.audio_combo, 5)
+        a.addLayout(audio_row)
 
         checks = QVBoxLayout()
         checks.setSpacing(4)
         self.audio_meta = QCheckBox()
         self.audio_thumb = QCheckBox()
+        self.audio_raw_aac_active = False
+        self.audio_saved_options = (True, True)
+        self.audio_chapter_preference = "none"
         self.audio_meta.setChecked(True)
         self.audio_thumb.setChecked(True)
         checks.addWidget(self.audio_meta)
@@ -1736,10 +1935,13 @@ class MainWindow(QMainWindow):
         container_row = QHBoxLayout()
         container_row.setSpacing(12)
 
-        self.mp4 = QRadioButton("MP4")
-        self.mkv = QRadioButton("MKV")
-        self.webm = QRadioButton("WebM")
+        self.mp4 = QPushButton("MP4")
+        self.mkv = QPushButton("MKV")
+        self.webm = QPushButton("WebM")
+        for button in (self.mp4, self.mkv, self.webm):
+            button.setCheckable(True)
         self.mp4.setChecked(True)
+        self.container_badges = {}
 
         self.video_container_group = QButtonGroup(self)
         for rb in [self.mp4, self.mkv, self.webm]:
@@ -1748,7 +1950,16 @@ class MainWindow(QMainWindow):
             rb.setMinimumHeight(28)
             self.video_container_group.addButton(rb)
             rb.toggled.connect(self.update_video_choices)
-            container_row.addWidget(rb)
+            column = QVBoxLayout()
+            column.setSpacing(2)
+            badge = QLabel("")
+            badge.setAlignment(Qt.AlignCenter)
+            badge.setFixedHeight(15)
+            badge.setStyleSheet("color: #d9ad48; font-size: 11px; font-weight: 800;")
+            self.container_badges[rb.text()] = badge
+            column.addWidget(badge)
+            column.addWidget(rb)
+            container_row.addLayout(column)
 
         container_row.addStretch(1)
         v.addLayout(container_row)
@@ -1756,13 +1967,35 @@ class MainWindow(QMainWindow):
         self.video_stream_label = QLabel()
         self.video_stream_label.setObjectName("keyLabel")
         v.addWidget(self.video_stream_label)
+        quality_labels = QHBoxLayout()
+        self.resolution_label = QLabel()
+        self.variant_label = QLabel()
+        quality_labels.addWidget(self.resolution_label, 2)
+        quality_labels.addWidget(self.variant_label, 5)
+        v.addLayout(quality_labels)
+        quality_row = QHBoxLayout()
+        self.resolution_combo = ChevronComboBox()
+        self.resolution_combo.setMinimumWidth(110)
+        self.resolution_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.resolution_combo.currentIndexChanged.connect(self.update_video_variants)
         self.video_combo = ChevronComboBox()
-        v.addWidget(self.video_combo)
+        self.video_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.video_combo.setMinimumWidth(150)
+        self.video_combo.currentIndexChanged.connect(self.update_video_details)
+        quality_row.addWidget(self.resolution_combo, 2)
+        quality_row.addWidget(self.video_combo, 5)
+        v.addLayout(quality_row)
+        self.video_details = QLabel()
+        self.video_details.setWordWrap(True)
+        self.video_details.setProperty("muted", True)
+        v.addWidget(self.video_details)
 
         self.video_audio_label = QLabel()
         self.video_audio_label.setObjectName("keyLabel")
         v.addWidget(self.video_audio_label)
         self.video_audio_combo = ChevronComboBox()
+        self.video_audio_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
+        self.video_audio_combo.setMinimumWidth(150)
         v.addWidget(self.video_audio_combo)
 
         video_checks = QGridLayout()
@@ -1891,40 +2124,50 @@ class MainWindow(QMainWindow):
         log_layout.addWidget(self.log)
         root.addWidget(self.log_group)
 
-        # Footer.
-        footer_frame = QFrame()
-        footer_frame.setObjectName("footerBar")
-        footer = QGridLayout(footer_frame)
-        footer.setContentsMargins(9, 6, 9, 6)
-        footer.setHorizontalSpacing(8)
-        footer.setVerticalSpacing(5)
+        # Information lives in a modeless dialog; labels stay live while hidden.
+        self.info_dialog = QDialog(self)
+        self.info_dialog.resize(610, 270)
+        info_layout = QVBoxLayout(self.info_dialog)
+        self.app_version_label = QLabel(f"{APP_NAME} v{APP_VERSION}")
         self.connection_label = QLabel("Connection: —")
-        self.connection_label.setProperty("muted", True)
-        self.connection_btn = QToolButton()
-        self.connection_btn.setText("⚙")
-        self.connection_btn.clicked.connect(self.show_network_settings)
         self.external_label = QLabel("External IP: —")
-        self.external_label.setProperty("muted", True)
         self.interface_label = QLabel("Interface: —")
-        self.interface_label.setProperty("muted", True)
-        self.refresh_net = QToolButton()
-        self.refresh_net.setText("↻")
-        self.refresh_net.clicked.connect(self.refresh_network_info)
         self.ytdlp_version = QLabel("yt-dlp: —")
         self.ffmpeg_version = QLabel("FFmpeg: —")
-        self.ytdlp_version.setProperty("muted", True)
-        self.ffmpeg_version.setProperty("muted", True)
         self.credit = QLabel("GUI concept by VJ Ostrov • powered by yt-dlp + FFmpeg")
-        self.credit.setProperty("muted", True)
-        footer.addWidget(self.connection_label, 0, 0)
-        footer.addWidget(self.connection_btn, 0, 1)
-        footer.addWidget(self.external_label, 0, 2)
-        footer.addWidget(self.interface_label, 0, 3)
-        footer.addWidget(self.refresh_net, 0, 4)
-        footer.addWidget(self.ytdlp_version, 1, 0, 1, 2)
-        footer.addWidget(self.ffmpeg_version, 1, 2)
-        footer.addWidget(self.credit, 2, 0, 1, 5)
-        root.addWidget(footer_frame)
+        for label in (self.app_version_label, self.connection_label, self.external_label,
+                      self.interface_label, self.ytdlp_version, self.ffmpeg_version, self.credit):
+            label.setWordWrap(True)
+            label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            info_layout.addWidget(label)
+        self.credit.installEventFilter(self)
+        self.credit_clicks = 0
+        self.credit_click_time = 0.0
+        self.easter_dialog = None
+        self.refresh_net = QPushButton()
+        self.refresh_net.clicked.connect(self.refresh_network_info)
+        info_layout.addWidget(self.refresh_net)
+        for button, mode in ((self.ch_none, "none"), (self.ch_embed, "embed"), (self.ch_split, "split")):
+            button.clicked.connect(lambda _checked=False, m=mode: setattr(self, "audio_chapter_preference", m))
+        self.help_buttons = []
+        for label, target in (
+            (self.url_label, self.analyze_btn), (self.output_label, self.output_edit),
+            (self.audio_stream_label, self.audio_track_combo),
+            (self.audio_format_label, self.audio_container_combo),
+            (self.audio_variant_label, self.audio_combo),
+            (self.audio_chapter_label, self.ch_embed),
+            (self.audio_meta, self.audio_meta), (self.audio_thumb, self.audio_thumb),
+            (self.container_label, self.mp4), (self.video_stream_label, self.resolution_combo),
+            (self.resolution_label, self.resolution_combo), (self.variant_label, self.video_combo),
+            (self.video_audio_label, self.video_audio_combo),
+        ):
+            button = attach_label_help(label, target)
+            if button:
+                self.help_buttons.append(button)
+        for group, target in ((self.remux_group, self.remux_ext),):
+            group.section_help = help_indicator(target, group)
+            self.help_buttons.append(group.section_help)
+        self.video_audio_combo.currentIndexChanged.connect(self.refresh_context_help)
         root.setAlignment(Qt.AlignTop)
 
     def apply_language(self):
@@ -1939,7 +2182,9 @@ class MainWindow(QMainWindow):
         self.audio_group.setTitle(
             "🎵  СКАЧАТЬ АУДИО" if self.lang == "RU" else "🎵  DOWNLOAD AUDIO"
         )
-        self.audio_stream_label.setText(self.tr("audio_stream"))
+        self.audio_stream_label.setText("1. Аудиодорожка" if self.lang == "RU" else "1. Audio track")
+        self.audio_format_label.setText("Формат файла" if self.lang == "RU" else "File format")
+        self.audio_variant_label.setText("Вариант потока" if self.lang == "RU" else "Stream variant")
         self.audio_meta.setText(self.tr("metadata"))
         self.audio_thumb.setText(self.tr("thumbnail"))
         self.audio_chapter_label.setText(self.tr("chapters"))
@@ -1953,7 +2198,10 @@ class MainWindow(QMainWindow):
             "🎬  СКАЧАТЬ ВИДЕО" if self.lang == "RU" else "🎬  DOWNLOAD VIDEO"
         )
         self.container_label.setText(self.tr("container"))
-        self.video_stream_label.setText(self.tr("video_stream"))
+        self.video_stream_label.setText("2. Качество" if self.lang == "RU" else "2. Quality")
+        self.resolution_label.setText("Разрешение" if self.lang == "RU" else "Resolution")
+        self.variant_label.setText("Вариант потока" if self.lang == "RU" else "Stream variant")
+        self.connection_btn.setText("Настройки маршрута подключения" if self.lang == "RU" else "Connection route settings")
         self.video_audio_label.setText(self.tr("video_audio"))
         self.video_meta.setText(self.tr("metadata"))
         self.video_thumb.setText(self.tr("thumbnail"))
@@ -1999,8 +2247,8 @@ class MainWindow(QMainWindow):
         self.log_title.setText("Журнал" if self.lang == "RU" else "Journal")
         self.status_label.setText(self.tr("ready"))
         self.deps_header_btn.setText(
-            "⚙  Зависимости / Обновления модулей" if self.lang == "RU"
-            else "⚙  Dependencies / Module updates"
+            "Зависимости / Обновления модулей" if self.lang == "RU"
+            else "Dependencies / Module updates"
         )
         self.progress_title.setText(
             "⬇  ОБЩИЙ ПРОГРЕСС СКАЧИВАНИЯ"
@@ -2008,6 +2256,9 @@ class MainWindow(QMainWindow):
             else "⬇  OVERALL DOWNLOAD PROGRESS"
         )
 
+        self.info_dialog.setWindowTitle("Информация о программе" if self.lang == "RU" else "Application information")
+        self.info_btn.setToolTip("Информация, версии модулей и сеть" if self.lang == "RU" else "Information, module versions and network")
+        self.refresh_net.setText("↻ Обновить сетевую информацию" if self.lang == "RU" else "↻ Refresh network information")
         self.update_tooltips()
 
         if self.current_info:
@@ -2209,6 +2460,40 @@ class MainWindow(QMainWindow):
                 else "Collapse / expand section"
             )
 
+        self.refresh_context_help()
+
+    def refresh_context_help(self, *_):
+        if not hasattr(self, "help_buttons"):
+            return
+        ru = self.lang == "RU"
+        def tip(widget, russian, english):
+            widget.setToolTip(russian if ru else english)
+        entry = self.selected_audio_entry()
+        ext = entry[1] if entry else ""
+        raw = ext == ".aac"
+        tip(self.audio_track_combo, "Выбери оригинал или дубляж по языку.", "Choose the original track or a dub by language.")
+        tip(self.audio_container_combo, "OPUS → .opus / .ogg; AAC → .m4a / .aac. Без перекодирования.", "OPUS → .opus / .ogg; AAC → .m4a / .aac. No transcoding.")
+        tip(self.audio_combo, "Битрейт и частота исходного потока. DRC — сжатый динамический диапазон.", "Source bitrate and sample rate. DRC means compressed dynamic range.")
+        tip(self.audio_meta, "В .aac/ADTS метаданные не встраиваются; выбери M4A." if raw else "Добавить название, автора и другие метаданные.", "AAC/ADTS cannot embed tags; choose M4A." if raw else "Add title, author and other metadata.")
+        tip(self.audio_thumb, "В .aac/ADTS обложка не встраивается; выбери M4A." if raw else "Встроить обложку в аудиофайл.", "AAC/ADTS cannot embed a cover; choose M4A." if raw else "Embed the cover in the audio file.")
+        tip(self.ch_embed, "Встроенные главы доступны только в M4A. Для Opus/OGG/AAC используй разделение на треки.", "Embedded chapters require M4A. For Opus/OGG/AAC, split into tracks.")
+        tip(self.audio_manual_btn, "Сначала выбери встраивание глав или разделение на треки." if self.ch_none.isChecked() else "Введи таймкоды: 00:00 Название.", "First select chapter embedding or track splitting." if self.ch_none.isChecked() else "Enter timestamps: 00:00 Title.")
+        tip(self.download_audio_btn, "Сначала проанализируй ссылку и выбери аудиопоток." if not entry else "Скачать выбранную дорожку без перекодирования.", "Analyze a link and select an audio stream first." if not entry else "Download the selected track without transcoding.")
+        tip(self.mp4, "MP4: H.264/AV1 + AAC. Другие потоки доступны в MKV/WebM.", "MP4: H.264/AV1 + AAC. Other streams are available in MKV/WebM.")
+        tip(self.mkv, "MKV: H.264/VP9/AV1 + AAC/Opus.", "MKV: H.264/VP9/AV1 + AAC/Opus.")
+        tip(self.webm, "WebM: VP9/AV1 + Opus. H.264/AAC несовместимы.", "WebM: VP9/AV1 + Opus. H.264/AAC are incompatible.")
+        tip(self.resolution_combo, "Показаны разрешения, совместимые с выбранным контейнером." if self.video_formats else "Сначала проанализируй ссылку.", "Resolutions compatible with the selected container." if self.video_formats else "Analyze a link first.")
+        tip(self.video_combo, "Варианты выбранного разрешения: кодек, FPS, битрейт и размер.", "Variants for this resolution: codec, FPS, bitrate and size.")
+        original_blocked = bool(self.filtered_video_audio) and self.selected_video_audio() is None
+        tip(self.video_audio_combo, "Оригинал несовместим с контейнером: смени контейнер или явно выбери дубляж." if original_blocked else "Только совместимое аудио; оригинал имеет приоритет.", "Original audio is incompatible: change container or explicitly choose a dub." if original_blocked else "Compatible audio only; original audio is preferred.")
+        missing = not self.selected_video_entry() or not self.selected_video_audio()
+        tip(self.download_video_btn, "Нужны совместимые видео и аудио: проанализируй ссылку и проверь контейнер." if missing else "Скачать выбранные видео и аудио без перекодирования.", "Compatible video and audio required: analyze a link and check the container." if missing else "Download the selected video and audio without transcoding.")
+        tip(self.remux_ext, "✓ — совместимо без перекодирования; отключённые варианты не поддерживают исходные кодеки.", "✓ means compatible without transcoding; disabled containers do not support the source codecs.")
+        tip(self.remux_button, "Выбери файл и совместимый контейнер; перепаковка сохраняет исходные кодеки.", "Select a file and compatible container; remuxing keeps the source codecs.")
+        tip(self.log, "Ход операции и причины ошибок.", "Operation progress and error details.")
+        for button in self.help_buttons:
+            button.setToolTip(button.help_target.toolTip())
+
     def startup_dependency_check(self):
         report = dependency_report()
         required_ok = (
@@ -2302,6 +2587,36 @@ class MainWindow(QMainWindow):
                 border-radius: {radius}px;
             }}
             QFrame#sourceCard,
+            QToolButton#helpIndicator {{
+                color: {skin["muted"]};
+                background: transparent;
+                border: 1px solid {skin["muted"]};
+                border-radius: 9px;
+                padding: 0;
+                font-size: 12px;
+                font-weight: 600;
+            }}
+            QToolButton#helpIndicator:hover {{
+                color: {skin["accent_alt"]};
+                border: 1px solid {skin["accent_alt"]};
+            }}
+            QLabel#networkQuestion {{
+                font-size: 20px;
+                font-weight: 800;
+                color: {skin["accent_alt"]};
+                padding: 4px 0 10px 0;
+            }}
+            QLabel#networkSection {{
+                font-size: 12px;
+                font-weight: 800;
+                color: {skin["accent_alt"]};
+                border-bottom: 1px solid {skin["border"]};
+                padding: 6px 0 5px 0;
+            }}
+            QPlainTextEdit#networkResult {{
+                border: 1px solid {skin["accent"]};
+                padding: 6px;
+            }}
             QFrame#footerBar {{
                 background-color: {skin["group"]};
                 border: 1px solid {skin["border"]};
@@ -2478,9 +2793,9 @@ class MainWindow(QMainWindow):
                 border-color: {skin["border"]};
             }}
             QPushButton#headerButton {{
-                background-color: transparent;
-                border-color: {skin["border"]};
-                padding: 5px 9px;
+                font-size: 11px;
+                padding: 6px 7px;
+                font-weight: 600;
             }}
 
             QFrame#remuxDropArea {{
@@ -2571,13 +2886,15 @@ class MainWindow(QMainWindow):
             QCheckBox {{
                 spacing: 6px;
             }}
-            QRadioButton[containerOption="true"] {{
+            QPushButton[containerOption="true"] {{
                 font-size: 12px;
                 font-weight: 700;
                 padding: 4px 7px;
             }}
-            QRadioButton[containerOption="true"]:checked {{
+            QPushButton[containerOption="true"]:checked {{
                 color: {skin["accent_alt"]};
+                background-color: {skin["field"]};
+                border: 2px solid {skin["accent_alt"]};
             }}
 
             QPushButton#compactAction {{
@@ -2725,63 +3042,59 @@ class MainWindow(QMainWindow):
             self.download_thumbnail()
 
     def clear_video_preview(self):
+        self.preview_generation += 1
+        for worker in self.preview_workers:
+            worker.requestInterruption()
         if hasattr(self, "preview_label"):
             self.preview_label.setPixmap(QPixmap())
             self.preview_label.setText("▶")
 
     def load_video_preview(self, info: dict):
         self.clear_video_preview()
-        thumb_url = str(info.get("thumbnail") or "").strip()
-        if not thumb_url:
-            thumbnails = info.get("thumbnails") or []
-            candidates = [
-                t for t in thumbnails
-                if isinstance(t, dict) and str(t.get("url") or "").strip()
-            ]
-            if candidates:
-                def score(item):
-                    try:
-                        width = int(item.get("width") or 0)
-                    except Exception:
-                        width = 0
-                    return (0, width) if width >= 160 else (1, -width)
-                candidates.sort(key=score)
-                thumb_url = str(candidates[0].get("url") or "").strip()
-        if not thumb_url:
+        primary = str(info.get("thumbnail") or "").strip()
+        items = [t for t in (info.get("thumbnails") or []) if isinstance(t, dict) and t.get("url")]
+        # JPEG first: portable decoding, then other formats. Retain fallback URLs.
+        items.sort(key=lambda t: (".jpg" not in str(t["url"]).lower() and ".jpeg" not in str(t["url"]).lower(), -float(t.get("width") or 0)))
+        urls = []
+        for url in [primary] + [str(t["url"]) for t in items]:
+            if url.startswith(("https://", "http://")) and url not in urls:
+                urls.append(url)
+        if not urls:
             return
-
-        proxy = ""
-        try:
-            resolved = resolve_proxy(
-                self.settings.get("network_mode", "Auto"),
-                self.settings.get("manual_proxy", ""),
-            )
-            if resolved.ok and str(resolved.proxy).lower().startswith(("http://", "https://")):
-                proxy = str(resolved.proxy)
-        except Exception:
-            pass
-
+        resolved = resolve_proxy(self.settings.get("network_mode", "Auto"), self.settings.get("manual_proxy", ""))
+        if not resolved.ok:
+            self.preview_failed(resolved.detail)
+            return
         self.preview_label.setText("…")
-        self.preview_worker = PreviewWorker(thumb_url, proxy)
-        self.preview_worker.loaded.connect(self.preview_loaded)
-        self.preview_worker.failed.connect(self.preview_failed)
-        self.preview_worker.start()
+        generation = self.preview_generation
+        worker = PreviewWorker(urls, resolved.proxy, self.effective_certificate_mode(), self)
+        self.preview_worker = worker
+        self.preview_workers.append(worker)
+        worker.loaded.connect(lambda data, g=generation: self.preview_loaded(data) if g == self.preview_generation else None)
+        worker.failed.connect(lambda error, g=generation: self.preview_failed(error) if g == self.preview_generation else None)
+        worker.finished.connect(lambda w=worker: self.preview_worker_finished(w))
+        worker.start()
+
+    def preview_worker_finished(self, worker):
+        if worker in self.preview_workers:
+            self.preview_workers.remove(worker)
+        if self.preview_worker is worker:
+            self.preview_worker = None
+        worker.deleteLater()
 
     def preview_loaded(self, data: bytes):
         pixmap = QPixmap()
         if pixmap.loadFromData(data):
-            pixmap = pixmap.scaled(
-                self.preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
-            )
+            pixmap = pixmap.scaled(self.preview_label.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
             self.preview_label.setText("")
             self.preview_label.setPixmap(pixmap)
         else:
-            self.clear_video_preview()
-        self.preview_worker = None
+            self.preview_failed("unsupported image format")
 
-    def preview_failed(self, _error: str):
+    def preview_failed(self, error: str):
         self.clear_video_preview()
-        self.preview_worker = None
+        message = "Превью обложки: " if self.lang == "RU" else "Thumbnail preview: "
+        self.append_log(message + str(error)[-600:])
 
     def update_connection_label(self):
         resolved = resolve_proxy(
@@ -2800,6 +3113,41 @@ class MainWindow(QMainWindow):
             self.connection_label.setText(
                 f"Connection: {resolved.name}{cert_suffix}"
             )
+
+    def eventFilter(self, watched, event):
+        if watched is getattr(self, "credit", None) and event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+            now = time.monotonic()
+            self.credit_clicks = self.credit_clicks + 1 if now - self.credit_click_time < 1.5 else 1
+            self.credit_click_time = now
+            if self.credit_clicks >= 3:
+                self.credit_clicks = 0
+                self.show_ostrov_easter_egg()
+        return super().eventFilter(watched, event)
+
+    def show_ostrov_easter_egg(self):
+        if self.easter_dialog is None:
+            self.easter_dialog = QDialog(self.info_dialog)
+            self.easter_dialog.setWindowTitle("VJ OSTROV — ORIGINAL MIX")
+            self.easter_dialog.setFixedSize(350, 180)
+            self.easter_dialog.setStyleSheet("QDialog { background: #171b1a; border: 2px solid #687868; } QLabel { color: #a4ff36; background: transparent; font-family: monospace; font-weight: bold; }")
+            layout = QVBoxLayout(self.easter_dialog)
+            title = QLabel("VJ OSTROV  //  ORIGINAL MIX")
+            title.setAlignment(Qt.AlignCenter)
+            layout.addWidget(title)
+            self.easter_equalizer = OstrovEqualizer()
+            layout.addWidget(self.easter_equalizer)
+            status = QLabel("100% COPY          0% TRANSCODE")
+            status.setAlignment(Qt.AlignCenter)
+            layout.addWidget(status)
+        self.easter_dialog.show()
+        self.easter_dialog.raise_()
+        self.easter_dialog.activateWindow()
+
+    def show_app_info(self):
+        self.info_dialog.setStyleSheet(self.styleSheet())
+        self.info_dialog.show()
+        self.info_dialog.raise_()
+        self.info_dialog.activateWindow()
 
     def show_network_settings(self):
         dlg = NetworkDialog(self, self.settings)
@@ -2947,6 +3295,8 @@ class MainWindow(QMainWindow):
         self.log.clear()
         self.clear_video_preview()
         self.append_log("> " + " ".join(f'"{x}"' if " " in x else x for x in cmd))
+        for badge in self.container_badges.values():
+            badge.setText("")
         self.video_title.setText("Анализирую..." if self.lang == "RU" else "Analyzing...")
         self.analyze_btn.setText(self.tr("cancel"))
         self.download_audio_btn.setEnabled(False)
@@ -3023,7 +3373,10 @@ class MainWindow(QMainWindow):
             return
 
         self.current_info = info
+        self.audio_map = []
         self.audio_formats, self.video_formats = parse_formats(info)
+        self.resolution_combo.setCurrentIndex(-1)
+        self.video_map = []
         title = str(info.get("title") or "YouTube")
         uploader = str(info.get("uploader") or "")
         duration = info.get("duration")
@@ -3062,54 +3415,72 @@ class MainWindow(QMainWindow):
         combo.setModel(model)
 
     def update_audio_choices(self):
-        rows: list[tuple[str, bool]] = []
-        mapping: list[Optional[tuple[AudioFormat, str]]] = []
+        previous = self.selected_audio_entry()
+        self.audio_track_combo.blockSignals(True)
+        self.audio_track_combo.clear()
+        self.audio_track_groups = {}
+        ordered = sorted(self.audio_formats, key=audio_preference_key)
+        for fmt in ordered:
+            key = (fmt.language, fmt.is_original, fmt.is_dubbed)
+            self.audio_track_groups.setdefault(key, []).append(fmt)
+        for key in self.audio_track_groups:
+            language, original, dubbed = key
+            name = ("Оригинал" if self.lang == "RU" else "Original") if original else ("Дубляж" if self.lang == "RU" else "Dubbed") if dubbed else ("Аудиодорожка" if self.lang == "RU" else "Audio track")
+            self.audio_track_combo.addItem(name + (" · " + language.upper() if language else ""), key)
+        key = (previous[0].language, previous[0].is_original, previous[0].is_dubbed) if previous else None
+        selected = next((i for i in range(self.audio_track_combo.count()) if self.audio_track_combo.itemData(i) == key), 0)
+        self.audio_track_combo.setCurrentIndex(selected if ordered else -1)
+        self.audio_track_combo.blockSignals(False)
+        self.update_audio_containers(preferred_id=previous[0].id if previous else None, preferred_ext=previous[1] if previous else None)
 
-        opus = sorted(
-            [x for x in self.audio_formats if x.codec == "Opus"],
-            key=lambda x: (x.is_drc, -x.abr),
-        )
-        aac = sorted(
-            [x for x in self.audio_formats if x.codec == "AAC"],
-            key=lambda x: (x.is_drc, -x.abr),
-        )
+    def update_audio_containers(self, *_args, preferred_id=None, preferred_ext=None):
+        if not hasattr(self, "audio_combo"):
+            return
+        group = getattr(self, "audio_track_groups", {}).get(self.audio_track_combo.currentData(), [])
+        if preferred_ext is None:
+            preferred_ext = self.audio_container_combo.currentData()
+        self.audio_container_combo.blockSignals(True)
+        self.audio_container_combo.clear()
+        first_selectable = -1
+        for heading, codec, choices in (
+            ("OPUS", "Opus", [("    ├ .opus", ".opus"), ("    └ .ogg", ".ogg")]),
+            ("AAC", "AAC", [("    ├ .m4a", ".m4a"), ("    └ .aac", ".aac")]),
+        ):
+            if not any(f.codec == codec for f in group):
+                continue
+            self.audio_container_combo.addItem(heading, None)
+            header = self.audio_container_combo.model().item(self.audio_container_combo.count()-1)
+            header.setFlags(Qt.NoItemFlags)
+            for name, ext in choices:
+                if first_selectable < 0:
+                    first_selectable = self.audio_container_combo.count()
+                self.audio_container_combo.addItem(name, ext)
+                hint = {".opus": "Opus в контейнере Ogg.", ".ogg": "Opus в контейнере Ogg, расширение .ogg.", ".m4a": "AAC в MP4: метаданные, обложка и главы.", ".aac": "AAC/ADTS: без метаданных, обложки и встроенных глав."} if self.lang == "RU" else {".opus": "Opus in an Ogg container.", ".ogg": "Opus in Ogg, with the .ogg extension.", ".m4a": "AAC in MP4: tags, cover and chapters.", ".aac": "AAC/ADTS: no tags, cover or embedded chapters."}
+                self.audio_container_combo.setItemData(self.audio_container_combo.count()-1, hint[ext], Qt.ToolTipRole)
+        index = self.audio_container_combo.findData(preferred_ext) if preferred_ext else -1
+        self.audio_container_combo.setCurrentIndex(index if index >= 0 else first_selectable)
+        self.audio_container_combo.blockSignals(False)
+        self.update_audio_variants(preferred_id=preferred_id)
 
-        def header(text):
-            rows.append((text, False))
-            mapping.append(None)
-
-        if opus:
-            header("OPUS / OGG")
-            header("────────────────────────────────────────")
-            for f in opus:
-                rows += [(f"{f.label}  →  .opus", True), (f"{f.label}  →  .ogg", True)]
-                mapping += [(f, ".opus"), (f, ".ogg")]
-
-        if opus and aac:
-            header("────────────────────────────────────────")
-
-        if aac:
-            header("AAC / M4A")
-            header("────────────────────────────────────────")
-            for f in aac:
-                rows += [(f"{f.label}  →  .m4a", True), (f"{f.label}  →  .aac", True)]
-                mapping += [(f, ".m4a"), (f, ".aac")]
-
-        self.audio_map = mapping
-        self.set_combo_rows(self.audio_combo, rows)
-
-        preferred = -1
-        for i, entry in enumerate(mapping):
-            if entry and entry[0].codec == "Opus" and not entry[0].is_drc and entry[1] == ".opus":
-                preferred = i
-                break
-        if preferred < 0:
-            for i, entry in enumerate(mapping):
-                if entry:
-                    preferred = i
-                    break
-        if preferred >= 0:
-            self.audio_combo.setCurrentIndex(preferred)
+    def update_audio_variants(self, *_args, preferred_id=None):
+        if not hasattr(self, "audio_meta"):
+            return
+        ext = self.audio_container_combo.currentData()
+        group = getattr(self, "audio_track_groups", {}).get(self.audio_track_combo.currentData(), [])
+        codec = "Opus" if ext in {".opus", ".ogg"} else "AAC"
+        streams = sorted([f for f in group if f.codec == codec], key=audio_preference_key)
+        self.audio_combo.blockSignals(True)
+        self.audio_combo.clear()
+        self.audio_map = [(fmt, ext) for fmt in streams]
+        for fmt in streams:
+            rate = f"~{fmt.abr:g} kbps" if fmt.abr else fmt.codec
+            sample = f"{fmt.asr / 1000:g} kHz" if fmt.asr else ""
+            size = "≈" + format_bytes(fmt.size) if fmt.size else ""
+            self.audio_combo.addItem(" · ".join(x for x in (rate, sample, size, "DRC" if fmt.is_drc else "") if x))
+            self.audio_combo.setItemData(self.audio_combo.count()-1, audio_display_label(fmt, self.lang) + f" • id {fmt.id}", Qt.ToolTipRole)
+        index = next((i for i,fmt in enumerate(streams) if fmt.id == preferred_id), 0)
+        self.audio_combo.setCurrentIndex(index if streams else -1)
+        self.audio_combo.blockSignals(False)
         self.audio_selection_changed()
 
     def audio_selection_changed(self):
@@ -3118,18 +3489,31 @@ class MainWindow(QMainWindow):
             return
         fmt, ext = self.audio_map[idx]
         self.ch_embed.setEnabled(ext == ".m4a")
-        if ext != ".m4a" and self.ch_embed.isChecked():
+        preference = self.audio_chapter_preference
+        if preference == "embed":
+            (self.ch_embed if ext == ".m4a" else self.ch_none).setChecked(True)
+        elif preference == "split":
+            self.ch_split.setChecked(True)
+        else:
             self.ch_none.setChecked(True)
         raw_aac = ext == ".aac"
+        if raw_aac and not self.audio_raw_aac_active:
+            self.audio_saved_options = (self.audio_meta.isChecked(), self.audio_thumb.isChecked())
         self.audio_meta.setEnabled(not raw_aac)
         self.audio_thumb.setEnabled(not raw_aac)
         if raw_aac:
             self.audio_meta.setChecked(False)
             self.audio_thumb.setChecked(False)
+        elif self.audio_raw_aac_active:
+            self.audio_meta.setChecked(self.audio_saved_options[0])
+            self.audio_thumb.setChecked(self.audio_saved_options[1])
+        self.audio_raw_aac_active = raw_aac
         self.audio_chapter_changed()
+        self.refresh_context_help()
 
     def audio_chapter_changed(self):
         self.audio_manual_btn.setEnabled(not self.ch_none.isChecked())
+        self.refresh_context_help()
 
     def selected_container(self) -> str:
         if self.mkv.isChecked():
@@ -3143,56 +3527,78 @@ class MainWindow(QMainWindow):
             return
         container = self.selected_container()
 
-        def video_ok(v):
-            if container == "MP4":
-                return v.codec in {"H.264", "AV1"}
-            if container == "WebM":
-                return v.codec in {"VP9", "AV1"}
-            return True
+        for name, badge in self.container_badges.items():
+            available = container_has_4k(self.video_formats, self.audio_formats, name)
+            badge.setText("4K" if available else "")
+            badge.setToolTip(("Доступен совместимый поток 4K" if self.lang == "RU" else "Compatible 4K stream available") if available else "")
 
-        def audio_ok(a):
-            if container == "MP4":
-                return a.codec == "AAC"
-            if container == "WebM":
-                return a.codec == "Opus"
-            return a.codec in {"AAC", "Opus"}
-
-        vids = [v for v in self.video_formats if video_ok(v)]
+        vids = [v for v in self.video_formats if video_container_compatible(v, container)]
         auds = sorted(
-            [a for a in self.audio_formats if audio_ok(a)],
-            key=lambda x: (x.is_drc, -x.abr),
+            [a for a in self.audio_formats if audio_container_compatible(a, container)],
+            key=audio_preference_key,
         )
         self.filtered_video_audio = auds
 
-        codec_order = ["H.264", "VP9", "AV1"]
-        rows: list[tuple[str, bool]] = []
-        mapping: list[Optional[object]] = []
-        for codec in codec_order:
-            group = [v for v in vids if v.codec == codec]
-            if not group:
-                continue
-            if rows:
-                rows.append(("────────────────────────────────────────", False))
-                mapping.append(None)
-            rows.append((codec, False))
-            mapping.append(None)
-            rows.append(("────────────────────────────────────────", False))
-            mapping.append(None)
-            for v in sorted(group, key=lambda x: (-x.height, -x.fps, -x.tbr)):
-                rows.append((v.label, True))
-                mapping.append(v)
-
-        self.video_map = mapping
-        self.set_combo_rows(self.video_combo, rows)
-        for i, entry in enumerate(mapping):
-            if entry:
-                self.video_combo.setCurrentIndex(i)
-                break
+        previous = self.selected_video_entry()
+        previous_id = previous.id if previous else None
+        previous_resolution = self.resolution_combo.currentData()
+        self.compatible_video_formats = vids
+        resolutions = sorted({(v.width, v.height) for v in vids},
+                             key=lambda size: (min(size) if all(size) else size[1], size[0] * size[1], size[1]), reverse=True)
+        self.resolution_combo.blockSignals(True)
+        self.resolution_combo.clear()
+        for width, height in resolutions:
+            pixels = min(width, height) if width and height else height
+            suffix = " · 8K" if pixels >= 4320 else " · 4K" if pixels >= 2160 else " · Full HD" if pixels == 1080 else " · HD" if pixels == 720 else ""
+            self.resolution_combo.addItem(f"{pixels}p{suffix}", (width, height))
+            self.resolution_combo.setItemData(self.resolution_combo.count()-1, f"{width}×{height}", Qt.ToolTipRole)
+        index = next((i for i in range(self.resolution_combo.count()) if self.resolution_combo.itemData(i) == previous_resolution), -1)
+        self.resolution_combo.setCurrentIndex(index if index >= 0 else 0)
+        self.resolution_combo.blockSignals(False)
+        self.update_video_variants(preferred_id=previous_id)
 
         self.video_audio_combo.clear()
-        self.video_audio_combo.addItem(self.tr("best"))
+        original_known = any(a.is_original for a in self.audio_formats)
+        original_compatible = any(a.is_original for a in auds)
+        auto_label = ("Оригинальная дорожка (авто)" if self.lang == "RU" else "Original audio (auto)") if original_compatible else self.tr("best")
+        if original_known and not original_compatible:
+            auto_label = "Оригинал несовместим — выбери другой контейнер" if self.lang == "RU" else "Original incompatible — choose another container"
+        self.video_audio_combo.addItem(auto_label)
         for a in auds:
-            self.video_audio_combo.addItem(a.label)
+            self.video_audio_combo.addItem(audio_display_label(a, self.lang))
+
+    def update_video_variants(self, *_args, preferred_id=None):
+        if not hasattr(self, "video_details"):
+            return
+        resolution = self.resolution_combo.currentData()
+        formats = [v for v in getattr(self, "compatible_video_formats", []) if (v.width, v.height) == resolution]
+        formats.sort(key=lambda v: (-v.fps, -v.tbr, v.codec, v.id))
+        self.video_combo.blockSignals(True)
+        self.video_combo.clear()
+        self.video_map = formats
+        for fmt in formats:
+            fps = f"{fmt.fps:g} fps" if fmt.fps else ""
+            rate = f"~{fmt.tbr / 1000:.1f} Mbps" if fmt.tbr else ""
+            size = "≈" + format_bytes(fmt.size) if fmt.size else ""
+            self.video_combo.addItem(" · ".join(x for x in (fmt.codec, fps, rate, size) if x))
+            self.video_combo.setItemData(self.video_combo.count()-1, fmt.label + f" • id {fmt.id}", Qt.ToolTipRole)
+        selected = next((i for i, fmt in enumerate(formats) if fmt.id == preferred_id), 0)
+        self.video_combo.setCurrentIndex(selected if formats else -1)
+        self.video_combo.blockSignals(False)
+        self.update_video_details()
+        self.refresh_context_help()
+
+    def update_video_details(self, *_):
+        if not hasattr(self, "video_details"):
+            return
+        fmt = self.selected_video_entry()
+        if fmt:
+            size = ("Примерный размер: " if self.lang == "RU" else "Estimated size: ") + format_bytes(fmt.size) if fmt.size else ""
+            self.video_details.setText(" · ".join(x for x in (f"{fmt.width}×{fmt.height}", size) if x))
+            self.video_details.setToolTip(fmt.label)
+        else:
+            self.video_details.setText("")
+            self.video_details.setToolTip("")
 
     def selected_audio_entry(self):
         idx = self.audio_combo.currentIndex()
@@ -3211,6 +3617,8 @@ class MainWindow(QMainWindow):
             return None
         idx = self.video_audio_combo.currentIndex()
         if idx <= 0:
+            if any(a.is_original for a in self.audio_formats) and not self.filtered_video_audio[0].is_original:
+                return None
             return self.filtered_video_audio[0]
         if idx - 1 < len(self.filtered_video_audio):
             return self.filtered_video_audio[idx - 1]
@@ -4319,6 +4727,14 @@ class MainWindow(QMainWindow):
         for worker in [self.analyze_worker, self.stream_worker]:
             if worker and worker.isRunning():
                 worker.cancel()
+
+        active_previews = [worker for worker in self.preview_workers if worker.isRunning()]
+        if active_previews:
+            for worker in active_previews:
+                worker.requestInterruption()
+            event.ignore()
+            QTimer.singleShot(150, self.close)
+            return
 
         # Short background probes should be allowed to finish cleanly.
         for worker in [self.network_worker, self.dependency_status_worker, self.preview_worker]:

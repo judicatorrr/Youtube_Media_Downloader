@@ -1,6 +1,7 @@
 @echo off
 setlocal
-cd /d "%~dp0"
+cd /d "%~dp0..\Files"
+if errorlevel 1 exit /b 1
 
 set "PYEXE="
 
@@ -41,7 +42,7 @@ python -m pip install -r requirements-build.txt
 python build_app.py --onefile
 
 echo.
-echo ONEFILE build is in the dist folder.
+echo ONEFILE build is in the Files\dist folder.
 pause
 exit /b 0
 

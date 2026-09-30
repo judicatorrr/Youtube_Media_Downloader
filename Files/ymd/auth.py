@@ -2,7 +2,7 @@
 from pathlib import Path
 import re
 
-BROWSERS = ("chrome", "firefox", "safari", "edge", "brave", "chromium", "opera", "vivaldi", "whale")
+BROWSERS = ("chrome", "firefox", "safari", "edge", "chromium", "opera", "yandex")
 
 def cookie_args(settings: dict) -> list[str]:
     mode = settings.get("cookies_mode", "None")
@@ -12,6 +12,9 @@ def cookie_args(settings: dict) -> list[str]:
         browser = settings.get("cookies_browser", "chrome")
         if browser not in BROWSERS:
             raise ValueError("Выбери поддерживаемый браузер / Select a supported browser.")
+        if browser == "yandex":
+            # yt-dlp has no native Yandex extractor; use an explicit export.
+            return cookie_args({"cookies_mode": "File", "cookies_file": settings.get("cookies_file", "")})
         return ["--cookies-from-browser", browser]
     if mode == "File":
         value = str(settings.get("cookies_file", "")).strip()
@@ -35,11 +38,11 @@ def bot_error_help(lang: str = "RU") -> str:
     if lang == "EN":
         return ("YouTube requires confirmation that you are not a bot.\n\n"
                 "1. Open this video in your browser using the same VPN/proxy as the app. Complete any verification.\n"
-                "2. In Connection settings (⚙ in the footer), choose Cookies → From browser and select that browser.\n"
+                "2. In Connection settings (network icon in the top right), choose Cookies → From browser and select that browser.\n"
                 "3. If access is still denied, try another VPN server/IP and update yt-dlp. Cookies do not guarantee access.\n\n"
                 "If cookie extraction fails, use a Netscape cookies.txt file. Do not share cookies: they may grant access to your account.")
     return ("YouTube просит подтвердить, что вы не бот.\n\n"
             "1. Открой это видео в браузере через тот же VPN/proxy, что и программа. Пройди проверку, если она появится.\n"
-            "2. В настройках подключения (⚙ внизу окна) выбери Cookies → Из браузера и укажи этот браузер.\n"
+            "2. В настройках подключения (значок сети справа вверху) выбери Cookies → Из браузера и укажи этот браузер.\n"
             "3. Если доступ по-прежнему закрыт, попробуй другой сервер/IP VPN и обнови yt-dlp. Cookies не гарантируют доступ.\n\n"
             "Если cookies не извлекаются, можно выбрать файл cookies.txt в формате Netscape. Не передавай cookies другим: они могут дать доступ к аккаунту.")

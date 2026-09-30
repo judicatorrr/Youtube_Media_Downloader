@@ -6,7 +6,7 @@
 
 Двойной клик:
 
-`BUILD_WINDOWS.bat`
+`../Windows/BUILD_WINDOWS.bat`
 
 После завершения:
 
@@ -17,10 +17,10 @@
 Первый раз:
 
 ```bash
-chmod +x BUILD_MAC.command
+chmod +x ../macOS/BUILD_MAC.command
 ```
 
-Затем запускай `BUILD_MAC.command`.
+Затем запускай `../macOS/BUILD_MAC.command`.
 
 Результат будет в папке `dist/` (обычно приложение `.app` / executable,
 в зависимости от версии PyInstaller).
@@ -28,8 +28,8 @@ chmod +x BUILD_MAC.command
 ## Linux
 
 ```bash
-chmod +x build_linux.sh
-./build_linux.sh
+chmod +x ../Linux/build_linux.sh
+./../Linux/build_linux.sh
 ```
 
 Результат:
@@ -71,8 +71,8 @@ PyInstaller включает Python runtime внутрь готового при
 предварительно установленного Python.
 
 Проверка и автоустановка Python относится к source/portable-python workflow,
-который запускается через `START_WINDOWS.bat`, `START_MAC.command` или
-`start_linux.sh`.
+который запускается через `../Windows/START_WINDOWS.bat`, `../macOS/START_MAC.command` или
+`../Linux/start_linux.sh`.
 
 
 ## Быстрый запуск: ONEDIR vs ONEFILE

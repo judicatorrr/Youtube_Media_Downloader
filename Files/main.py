@@ -7,6 +7,7 @@ from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import QApplication
 
 from ymd.ui import MainWindow
+from ymd.tooltip_style import DelayedTooltipStyle
 
 
 def resource_path(relative: str) -> Path:
@@ -19,7 +20,7 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("YouTube Media Downloader")
     app.setOrganizationName("VJ Ostrov")
-    app.setStyle("Fusion")
+    app.setStyle(DelayedTooltipStyle())
 
     icon_path = resource_path("resources/app_icon.png")
     if icon_path.exists():
