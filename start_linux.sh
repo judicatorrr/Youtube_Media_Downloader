@@ -26,15 +26,13 @@ if [ -z "$PYTHON_EXE" ]; then
 
   if command -v apt-get >/dev/null 2>&1; then
     sudo apt-get update
-    sudo apt-get install -y python3.12 python3.12-venv python3-pip \
-      || sudo apt-get install -y python3 python3-venv python3-pip
+    sudo apt-get install -y python3 python3-venv python3-pip ca-certificates
   elif command -v dnf >/dev/null 2>&1; then
-    sudo dnf install -y python3 python3-pip
+    sudo dnf install -y python3 python3-pip ca-certificates
   elif command -v pacman >/dev/null 2>&1; then
-    sudo pacman -S --needed --noconfirm python python-pip
+    sudo pacman -S --needed --noconfirm python python-pip ca-certificates
   elif command -v zypper >/dev/null 2>&1; then
-    sudo zypper --non-interactive install python311 python311-pip \
-      || sudo zypper --non-interactive install python3 python3-pip
+    sudo zypper --non-interactive install python3 python3-pip ca-certificates
   else
     echo "No supported package manager was found (apt/dnf/pacman/zypper)."
     exit 1
@@ -48,7 +46,30 @@ if [ -z "$PYTHON_EXE" ]; then
   exit 1
 fi
 
+# yt-dlp Auto mode on Linux intentionally uses the system CA store.
+# Ensure a CA bundle exists, especially on minimal distributions/containers.
+if [ ! -s /etc/ssl/certs/ca-certificates.crt ] && \
+   [ ! -s /etc/pki/tls/certs/ca-bundle.crt ] && \
+   [ ! -s /etc/ssl/ca-bundle.pem ]; then
+  echo "System CA certificates are missing. Installing ca-certificates..."
+  if command -v apt-get >/dev/null 2>&1; then
+    sudo apt-get update
+    sudo apt-get install -y ca-certificates
+  elif command -v dnf >/dev/null 2>&1; then
+    sudo dnf install -y ca-certificates
+  elif command -v pacman >/dev/null 2>&1; then
+    sudo pacman -S --needed --noconfirm ca-certificates
+  elif command -v zypper >/dev/null 2>&1; then
+    sudo zypper --non-interactive install ca-certificates
+  fi
+fi
+
 echo "Python: $PYTHON_EXE"
+
+if [ -x ".venv/bin/python" ] && ! python_ok ".venv/bin/python"; then
+  echo "Old Python detected in .venv. Recreating environment..."
+  rm -rf .venv
+fi
 
 if [ ! -x ".venv/bin/python" ]; then
   "$PYTHON_EXE" -m venv .venv

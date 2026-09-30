@@ -47,6 +47,7 @@ from PySide6.QtWidgets import (
 )
 
 from . import APP_NAME, APP_VERSION
+from .auth import BROWSERS, cookie_args, is_youtube_bot_error, bot_error_help
 from .dependencies import install_dependency, check_dependency_updates
 
 from .skins import SKIN_ORDER, get_skin
@@ -64,10 +65,12 @@ from .core import (
     AudioFormat,
     CaptureWorker,
     clear_tool_cache,
+    certificate_process_env,
     StreamWorker,
     app_dir,
     dependency_report,
     dependency_version,
+    external_ytdlp_path,
     deno_path,
     external_ip,
     ffmpeg_path,
@@ -76,6 +79,7 @@ from .core import (
     format_bytes,
     get_system_proxy,
     is_valid_youtube_url,
+    is_ssl_certificate_error,
     load_settings,
     local_interface_hint,
     open_folder,
@@ -568,7 +572,7 @@ class NetworkDialog(QDialog):
         super().__init__(parent)
         self.settings = settings
         self.setWindowTitle("Подключение к YouTube")
-        self.resize(590, 500)
+        self.resize(660, 760)
 
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("Как yt-dlp должен выходить в интернет?"))
@@ -607,6 +611,71 @@ class NetworkDialog(QDialog):
         )
         layout.addWidget(self.proxy_edit)
 
+        cert_title = QLabel("HTTPS-сертификаты")
+        cert_title.setStyleSheet("font-weight: 650;")
+        layout.addWidget(cert_title)
+
+        self.cert_mode = ChevronComboBox()
+        self.cert_mode.addItem("Автоматически (рекомендуется)", "Auto")
+        if platform.system() == "Darwin":
+            self.cert_mode.addItem("macOS Keychain + публичные CA", "MacKeychain")
+        self.cert_mode.addItem("Системные сертификаты OpenSSL", "System")
+        self.cert_mode.addItem("Встроенный certifi", "Certifi")
+        self.cert_mode.addItem("Не проверять сертификаты (небезопасно)", "Insecure")
+
+        saved_cert = settings.get("certificate_mode", "Auto")
+        cert_index = self.cert_mode.findData(saved_cert)
+        self.cert_mode.setCurrentIndex(cert_index if cert_index >= 0 else 0)
+        layout.addWidget(self.cert_mode)
+
+        cert_hint = QLabel(
+            "Auto: Windows → certifi; macOS → Keychain + публичные CA; "
+            "Linux → системный CA bundle. Отключение проверки SSL — только "
+            "после явного подтверждения и как последний вариант."
+        )
+        cert_hint.setWordWrap(True)
+        cert_hint.setProperty("muted", True)
+        layout.addWidget(cert_hint)
+
+        lang = getattr(parent, "lang", "RU")
+        en = lang == "EN"
+        cookies_title = QLabel("YouTube cookies (optional)" if en else "Cookies YouTube (по необходимости)")
+        cookies_title.setStyleSheet("font-weight: 650;")
+        layout.addWidget(cookies_title)
+        self.cookies_mode = ChevronComboBox()
+        for label, value in [("Disabled" if en else "Не использовать", "None"),
+                             ("From browser" if en else "Из браузера", "Browser"),
+                             ("From cookies.txt" if en else "Из файла cookies.txt", "File")]:
+            self.cookies_mode.addItem(label, value)
+        idx = self.cookies_mode.findData(settings.get("cookies_mode", "None"))
+        self.cookies_mode.setCurrentIndex(max(0, idx))
+        layout.addWidget(self.cookies_mode)
+        self.cookies_browser = ChevronComboBox()
+        for browser in BROWSERS:
+            if browser != "safari" or platform.system() == "Darwin":
+                self.cookies_browser.addItem(browser.capitalize(), browser)
+        idx = self.cookies_browser.findData(settings.get("cookies_browser", "chrome"))
+        self.cookies_browser.setCurrentIndex(max(0, idx))
+        layout.addWidget(self.cookies_browser)
+        file_row = QHBoxLayout()
+        self.cookies_file = QLineEdit(settings.get("cookies_file", ""))
+        self.cookies_file.setPlaceholderText("cookies.txt (Netscape)")
+        self.cookies_browse = QPushButton("Browse…" if en else "Обзор…")
+        self.cookies_browse.clicked.connect(self.browse_cookies)
+        file_row.addWidget(self.cookies_file, 1)
+        file_row.addWidget(self.cookies_browse)
+        layout.addLayout(file_row)
+        cookie_hint = QLabel(
+            "Open the video in this browser using the same VPN/proxy. Cookies are read only when you select this mode. macOS may ask for Keychain or file access. Do not share cookies: they may grant account access."
+            if en else
+            "Открой видео в выбранном браузере через тот же VPN/proxy. Cookies читаются только при выборе этого режима. macOS может запросить доступ к связке ключей или файлам. Не передавай cookies другим: они могут дать доступ к аккаунту."
+        )
+        cookie_hint.setWordWrap(True)
+        cookie_hint.setProperty("muted", True)
+        layout.addWidget(cookie_hint)
+        self.cookies_mode.currentIndexChanged.connect(self.update_cookie_state)
+        self.update_cookie_state()
+
         current = settings.get("network_mode", "Auto")
         for button in self.group.buttons():
             if button.property("mode") == current:
@@ -638,9 +707,37 @@ class NetworkDialog(QDialog):
         for button in self.group.buttons():
             button.toggled.connect(self.update_manual_state)
 
+    def cookie_settings(self) -> dict:
+        return {"cookies_mode": self.cookies_mode.currentData() or "None",
+                "cookies_browser": self.cookies_browser.currentData() or "chrome",
+                "cookies_file": self.cookies_file.text().strip()}
+
+    def update_cookie_state(self, *_):
+        mode = self.cookies_mode.currentData()
+        self.cookies_browser.setEnabled(mode == "Browser")
+        self.cookies_file.setEnabled(mode == "File")
+        self.cookies_browse.setEnabled(mode == "File")
+
+    def browse_cookies(self):
+        path, _ = QFileDialog.getOpenFileName(self, "cookies.txt", self.cookies_file.text(), "Cookies (*.txt);;All files (*)")
+        if path:
+            self.cookies_file.setText(path)
+
+    def accept(self):
+        try:
+            cookie_args(self.cookie_settings())
+        except ValueError as exc:
+            self.result.setPlainText(str(exc))
+            return
+        super().accept()
+
     def mode(self) -> str:
         button = self.group.checkedButton()
         return str(button.property("mode")) if button else "Auto"
+
+    def certificate_mode(self) -> str:
+        value = self.cert_mode.currentData()
+        return str(value or "Auto")
 
     def update_manual_state(self):
         self.proxy_edit.setEnabled(self.mode() == "Manual")
@@ -654,7 +751,12 @@ class NetworkDialog(QDialog):
         if not resolved.ok:
             self.result.setPlainText("✕ " + resolved.detail)
             return
-        cmd = base + net_args + ytdlp_common_args() + [
+        try:
+            auth_args = cookie_args(self.cookie_settings())
+        except ValueError as exc:
+            self.result.setPlainText(str(exc))
+            return
+        cmd = base + auth_args + net_args + ytdlp_common_args(self.certificate_mode()) + [
             "--socket-timeout", "8",
             "--ignore-no-formats-error",
             "--skip-download",
@@ -664,7 +766,12 @@ class NetworkDialog(QDialog):
         ]
         self.test_btn.setEnabled(False)
         self.result.setPlainText("Проверка...")
-        self.worker = CaptureWorker(cmd, app_dir(), timeout=20)
+        self.worker = CaptureWorker(
+            cmd,
+            app_dir(),
+            timeout=60 if auth_args else 20,
+            extra_env=certificate_process_env(self.certificate_mode()),
+        )
         self.worker.completed.connect(self.test_completed)
         self.worker.failed.connect(lambda e: self.test_completed(1, "", e))
         self.worker.start()
@@ -672,6 +779,18 @@ class NetworkDialog(QDialog):
     def test_completed(self, code: int, out: str, err: str):
         self.test_btn.setEnabled(True)
         all_text = out + "\n" + err
+        if is_youtube_bot_error(all_text):
+            self.result.setPlainText(bot_error_help(getattr(self.parent(), "lang", "RU")))
+            return
+        if is_ssl_certificate_error(all_text):
+            self.result.setPlainText(
+                "✕ Ошибка проверки HTTPS-сертификата.\n"
+                "На macOS попробуй «macOS Keychain + публичные CA». "
+                "Если даже Keychain не помогает, сеть/VPN, вероятно, подменяет "
+                "HTTPS неизвестным сертификатом."
+            )
+            return
+
         network_error = re.search(
             r"failed to resolve|getaddrinfo|connection refused|unable to connect|"
             r"network is unreachable|timed out|proxy.*error|tunnel connection failed|"
@@ -700,10 +819,16 @@ class DependencyInstallWorker(QThread):
     log_line = Signal(str)
     completed_install = Signal(bool, str)
 
-    def __init__(self, key: str, proxy: str = ""):
+    def __init__(
+        self,
+        key: str,
+        proxy: str = "",
+        certificate_mode: str = "Auto",
+    ):
         super().__init__()
         self.key = key
         self.proxy = proxy
+        self.certificate_mode = certificate_mode
 
     def run(self):
         try:
@@ -712,6 +837,7 @@ class DependencyInstallWorker(QThread):
                 proxy=self.proxy,
                 progress_cb=lambda value, text: self.progress_changed.emit(value, text),
                 log_cb=lambda text: self.log_line.emit(text),
+                certificate_mode=self.certificate_mode,
             )
             self.completed_install.emit(True, "")
         except Exception as exc:
@@ -754,14 +880,26 @@ class DependencyStatusWorker(QThread):
 class DependencyUpdateCheckWorker(QThread):
     completed_check = Signal(object)
 
-    def __init__(self, report: dict, proxy: str = ""):
+    def __init__(
+        self,
+        report: dict,
+        proxy: str = "",
+        certificate_mode: str = "Auto",
+    ):
         super().__init__()
         self.report = report
         self.proxy = proxy
+        self.certificate_mode = certificate_mode
 
     def run(self):
         try:
-            self.completed_check.emit(check_dependency_updates(self.report, self.proxy))
+            self.completed_check.emit(
+                check_dependency_updates(
+                    self.report,
+                    self.proxy,
+                    self.certificate_mode,
+                )
+            )
         except Exception:
             self.completed_check.emit({})
 
@@ -773,6 +911,7 @@ class DependencyDialog(QDialog):
         self.worker = None
         self.update_check_worker = None
         self.update_info = {}
+        self.update_all_queue: list[str] = []
         self.parent_window = parent
         self.setWindowTitle("Dependency check" if lang == "EN" else "Проверка зависимостей")
         self.resize(760, 560)
@@ -799,10 +938,11 @@ class DependencyDialog(QDialog):
         self.rows = {}
         row = 0
         for key, title in [
+            ("python", "Python runtime"),
             ("yt_dlp", "yt-dlp"),
             ("ffmpeg", "FFmpeg"),
             ("ffprobe", "FFprobe"),
-            ("deno", "Deno (optional)" if lang == "EN" else "Deno (необязательно)"),
+            ("deno", "Deno JS runtime"),
         ]:
             title_label = QLabel(title)
             status_label = QLabel("—")
@@ -818,9 +958,15 @@ class DependencyDialog(QDialog):
             row += 1
 
         extra = QLabel(
-            "Notes: yt-dlp is required for analysis/download. FFmpeg + FFprobe are required for merging, remuxing, fragments and chapters. Deno is optional: if present, the app passes it to yt-dlp as JS runtime."
+            "Notes: yt-dlp, Deno, FFmpeg and FFprobe are managed here. "
+            "Python 3.11+ is recommended by current yt-dlp. A compiled .app/.exe "
+            "contains its own Python runtime, so that embedded runtime is upgraded "
+            "by rebuilding the app; external modules can be updated directly here."
             if lang == "EN" else
-            "Примечание: yt-dlp нужен для анализа и скачивания. FFmpeg + FFprobe нужны для склейки, перепаковки, фрагментов и глав. Deno необязателен: если он найден, программа передаст его в yt-dlp как JS runtime."
+            "Примечание: здесь обновляются yt-dlp, Deno, FFmpeg и FFprobe. "
+            "Современный yt-dlp рекомендует Python 3.11+. В собранном .app/.exe "
+            "Python встроен внутрь приложения, поэтому его версия меняется при "
+            "пересборке; внешние модули обновляются прямо из этого окна."
         )
         extra.setWordWrap(True)
         extra.setProperty("muted", True)
@@ -839,12 +985,17 @@ class DependencyDialog(QDialog):
 
         buttons = QHBoxLayout()
         self.recheck_btn = QPushButton("Recheck" if lang == "EN" else "Проверить ещё раз")
+        self.update_all_btn = QPushButton(
+            "Update all modules" if lang == "EN" else "Обновить все модули"
+        )
         self.continue_btn = QPushButton("Continue" if lang == "EN" else "Продолжить")
         self.exit_btn = QPushButton("Exit" if lang == "EN" else "Выход")
         self.recheck_btn.clicked.connect(self.refresh)
+        self.update_all_btn.clicked.connect(self.update_all_modules)
         self.continue_btn.clicked.connect(self.accept)
         self.exit_btn.clicked.connect(self.reject)
         buttons.addWidget(self.recheck_btn)
+        buttons.addWidget(self.update_all_btn)
         buttons.addStretch(1)
         buttons.addWidget(self.continue_btn)
         buttons.addWidget(self.exit_btn)
@@ -870,6 +1021,14 @@ class DependencyDialog(QDialog):
             pass
         return proxy
 
+    def dependency_certificate_mode(self) -> str:
+        try:
+            if self.parent_window is not None:
+                return self.parent_window.effective_certificate_mode()
+        except Exception:
+            pass
+        return "Auto"
+
     def set_status_style(self, label: QLabel, state: str):
         colors = {
             "ok": "#35d07f",
@@ -884,10 +1043,60 @@ class DependencyDialog(QDialog):
         clear_tool_cache()
         report = dependency_report()
         self.last_report = report
-        all_required_ok = report["yt_dlp"]["ok"] and report["ffmpeg"]["ok"] and report["ffprobe"]["ok"]
+
+        # For YouTube in 2026, Deno is treated as required because yt-dlp
+        # increasingly relies on an external JS runtime for challenge solving.
+        all_required_ok = (
+            report["yt_dlp"]["ok"]
+            and report["yt_dlp"].get("external")
+            and report["ffmpeg"]["ok"]
+            and report["ffprobe"]["ok"]
+            and report["deno"]["ok"]
+        )
 
         missing = []
-        for key, required in [("yt_dlp", True), ("ffmpeg", True), ("ffprobe", True), ("deno", False)]:
+
+        # Python runtime is informational inside a compiled app.
+        py_status, py_button = self.rows["python"]
+        py = report["python"]
+        py_ver = py.get("version", "")
+        if py.get("recommended"):
+            py_status.setText(
+                ("✓ Python runtime: " if self.lang == "EN" else "✓ Python runtime: ")
+                + py_ver
+                + (" • embedded in app" if py.get("frozen") and self.lang == "EN" else
+                   " • встроен в приложение" if py.get("frozen") else "")
+            )
+            self.set_status_style(py_status, "ok")
+        else:
+            py_status.setText(
+                (
+                    f"⚠ Python {py_ver}: yt-dlp recommends Python 3.11+. "
+                    + ("Rebuild the app with Python 3.12." if py.get("frozen")
+                       else "Restart via the launcher; it will upgrade/recreate the environment.")
+                )
+                if self.lang == "EN"
+                else
+                (
+                    f"⚠ Python {py_ver}: yt-dlp рекомендует Python 3.11+. "
+                    + ("Эту сборку нужно пересобрать на Python 3.12." if py.get("frozen")
+                       else "Перезапусти через стартовый скрипт — он обновит Python/окружение.")
+                )
+            )
+            self.set_status_style(py_status, "update")
+        py_button.setText("Info" if self.lang == "EN" else "Инфо")
+        try:
+            py_button.clicked.disconnect()
+        except Exception:
+            pass
+        py_button.clicked.connect(self.show_python_info)
+
+        for key, required in [
+            ("yt_dlp", True),
+            ("ffmpeg", True),
+            ("ffprobe", True),
+            ("deno", True),
+        ]:
             status_label, action_btn = self.rows[key]
             info = report[key]
 
@@ -903,7 +1112,23 @@ class DependencyDialog(QDialog):
 
                 version_suffix = f" • {ver}" if ver else ""
                 update = self.update_info.get(key, {})
-                if update.get("update"):
+
+                # A Python-module fallback works, but we deliberately replace it
+                # with the official platform binary.
+                module_fallback = key == "yt_dlp" and info.get("module_fallback")
+                if module_fallback:
+                    status_label.setText(
+                        (
+                            "⚠ Python-module fallback is in use. Install the official platform binary"
+                            if self.lang == "EN"
+                            else
+                            "⚠ Используется Python-модуль. Установи официальный бинарник для платформы"
+                        )
+                        + version_suffix
+                    )
+                    self.set_status_style(status_label, "update")
+                    missing.append("yt_dlp_binary")
+                elif update.get("update"):
                     latest = update.get("latest", "")
                     status_label.setText(
                         ("⚠ Update available" if self.lang == "EN" else "⚠ Доступно обновление")
@@ -921,22 +1146,13 @@ class DependencyDialog(QDialog):
                 action_btn.setText("Update" if self.lang == "EN" else "Обновить")
             else:
                 self.update_info.pop(key, None)
-                if required:
-                    missing.append(key)
-                    status_label.setText(
-                        "✕ Missing — click Update to download automatically"
-                        if self.lang == "EN" else
-                        "✕ Не найден — нажми «Обновить», программа скачает автоматически"
-                    )
-                    self.set_status_style(status_label, "missing")
-                else:
-                    status_label.setText(
-                        "○ Optional — click Update to download"
-                        if self.lang == "EN" else
-                        "○ Необязательно — нажми «Обновить», чтобы скачать"
-                    )
-                    self.set_status_style(status_label, "optional")
-
+                missing.append(key)
+                status_label.setText(
+                    "✕ Missing — click Update to download automatically"
+                    if self.lang == "EN" else
+                    "✕ Не найден — нажми «Обновить», программа скачает автоматически"
+                )
+                self.set_status_style(status_label, "missing")
                 action_btn.setText("Update" if self.lang == "EN" else "Обновить")
 
         if all_required_ok:
@@ -948,13 +1164,14 @@ class DependencyDialog(QDialog):
         else:
             names = ", ".join(missing)
             self.summary.setText(
-                f"Missing required dependencies: {names}. Click Update next to the missing item."
+                f"Missing/recommended dependencies: {names}. The app can install them automatically."
                 if self.lang == "EN" else
-                f"Не найдены обязательные зависимости: {names}. Нажми «Обновить» напротив нужного пункта."
+                f"Не хватает обязательных/рекомендуемых компонентов: {names}. Программа может установить их автоматически."
             )
 
         self.continue_btn.setEnabled(all_required_ok)
         self.start_update_check(report)
+
 
     def start_update_check(self, report: dict):
         if self.update_check_worker and self.update_check_worker.isRunning():
@@ -965,6 +1182,7 @@ class DependencyDialog(QDialog):
         self.update_check_worker = DependencyUpdateCheckWorker(
             report,
             self.dependency_proxy(),
+            self.dependency_certificate_mode(),
         )
         self.update_check_worker.completed_check.connect(self.update_check_done)
         self.update_check_worker.start()
@@ -1012,8 +1230,10 @@ class DependencyDialog(QDialog):
 
         required_ok = (
             report["yt_dlp"]["ok"]
+            and report["yt_dlp"].get("external")
             and report["ffmpeg"]["ok"]
             and report["ffprobe"]["ok"]
+            and report["deno"]["ok"]
         )
         if required_ok:
             if updates_found:
@@ -1031,9 +1251,82 @@ class DependencyDialog(QDialog):
         self.continue_btn.setEnabled(required_ok)
 
 
-    def handle_action(self, key: str):
+    def show_python_info(self):
+        report = dependency_report()
+        py = report["python"]
+        version = py.get("version", "?")
+
+        if py.get("frozen"):
+            text = (
+                f"Текущая сборка содержит встроенный Python {version}.\n\n"
+                "Встроенный Python нельзя безопасно заменить внутри уже собранного .app/.exe. "
+                "Зато yt-dlp теперь устанавливается как отдельный официальный бинарник и не "
+                "зависит от Python приложения.\n\n"
+                "Чтобы обновить именно runtime приложения, пересобери его новым BUILD-скриптом: "
+                "он теперь требует Python 3.11+ и предпочитает Python 3.12."
+                if self.lang != "EN"
+                else
+                f"This build contains embedded Python {version}.\n\n"
+                "An embedded Python runtime cannot be safely replaced inside an already-built app. "
+                "yt-dlp is now installed as a separate official binary and no longer depends on the "
+                "app's Python runtime.\n\nRebuild with the new BUILD script to upgrade the app runtime; "
+                "it now requires Python 3.11+ and prefers Python 3.12."
+            )
+        else:
+            text = (
+                f"Текущий Python: {version}.\n\n"
+                "Source-версия обновляет/пересоздаёт .venv через START_* launcher. "
+                "Закрой приложение и запусти его через START_MAC.command / START_WINDOWS.bat / start_linux.sh."
+                if self.lang != "EN"
+                else
+                f"Current Python: {version}.\n\n"
+                "The source build upgrades/recreates its .venv through the START_* launcher. "
+                "Close the app and start it through the platform launcher."
+            )
+
+        QMessageBox.information(
+            self,
+            "Python runtime",
+            text,
+        )
+
+    def update_all_modules(self):
         if self.worker and self.worker.isRunning():
             return
+
+        # FFmpeg and FFprobe are one installation job.
+        self.update_all_queue = ["yt_dlp", "deno", "ffmpeg"]
+        self.append_log(
+            "Updating all external modules..."
+            if self.lang == "EN"
+            else "Обновляю все внешние модули..."
+        )
+        self.run_next_update_all()
+
+    def run_next_update_all(self):
+        if not self.update_all_queue:
+            clear_tool_cache()
+            self.append_log(
+                "All module updates completed."
+                if self.lang == "EN"
+                else "Обновление всех модулей завершено."
+            )
+            self.refresh()
+            return
+
+        key = self.update_all_queue.pop(0)
+        self.handle_action(key, from_update_all=True)
+
+    def handle_action(self, key: str, from_update_all: bool = False):
+        if key == "python":
+            self.show_python_info()
+            return
+
+        if self.worker and self.worker.isRunning():
+            return
+
+        if not from_update_all:
+            self.update_all_queue = []
 
         label = {
             "yt_dlp": "yt-dlp",
@@ -1053,7 +1346,11 @@ class DependencyDialog(QDialog):
         self.install_progress.setVisible(True)
         self.set_buttons_enabled(False)
 
-        self.worker = DependencyInstallWorker(key, proxy)
+        self.worker = DependencyInstallWorker(
+            key,
+            proxy,
+            self.dependency_certificate_mode(),
+        )
         self.worker.log_line.connect(self.append_log)
         self.worker.progress_changed.connect(self.install_progress_changed)
         self.worker.completed_install.connect(
@@ -1063,6 +1360,7 @@ class DependencyDialog(QDialog):
 
     def set_buttons_enabled(self, enabled: bool):
         self.recheck_btn.setEnabled(enabled)
+        self.update_all_btn.setEnabled(enabled)
         for _, button in self.rows.values():
             button.setEnabled(enabled)
         if not enabled:
@@ -1088,14 +1386,45 @@ class DependencyDialog(QDialog):
             self.append_log(
                 ("Update failed: " if self.lang == "EN" else "Ошибка обновления: ") + error
             )
+            if is_ssl_certificate_error(error):
+                message = (
+                    "Не удалось безопасно скачать модуль из-за HTTPS-сертификата.\n\n"
+                    "Обновлятор теперь использует тот же macOS Keychain, что и yt-dlp. "
+                    "Если ошибка повторяется даже в этой версии, проверь, что сертификат "
+                    "VPN/proxy действительно добавлен в Keychain macOS.\n\n"
+                    "Проверку сертификатов для загрузки исполняемых модулей программа "
+                    "автоматически не отключает — это сделано специально для безопасности."
+                    if self.lang != "EN"
+                    else
+                    "The module could not be downloaded safely because of an HTTPS "
+                    "certificate error.\n\nThe updater now uses the same macOS Keychain "
+                    "bundle as yt-dlp. If this still fails, verify that the VPN/proxy CA "
+                    "is trusted in macOS Keychain.\n\nCertificate verification is not "
+                    "silently disabled for executable dependency downloads."
+                )
+            else:
+                message = (
+                    ("Could not update dependency:\n" if self.lang == "EN"
+                     else "Не удалось обновить зависимость:\n")
+                    + error
+                )
+
             QMessageBox.critical(
                 self,
                 APP_NAME,
-                ("Could not update dependency:\n" if self.lang == "EN" else "Не удалось обновить зависимость:\n") + error,
+                message,
             )
 
         self.worker = None
         clear_tool_cache()
+
+        if ok and self.update_all_queue:
+            self.run_next_update_all()
+            return
+
+        if not ok:
+            self.update_all_queue = []
+
         self.refresh()
         if self.parent_window is not None:
             self.parent_window.refresh_dependency_labels()
@@ -1127,6 +1456,9 @@ class MainWindow(QMainWindow):
         self.network_worker: Optional[NetworkWorker] = None
         self.preview_worker: Optional[PreviewWorker] = None
         self.dependency_status_worker: Optional[DependencyStatusWorker] = None
+        self.session_certificate_override: Optional[str] = None
+        self.pending_ssl_retry_url: Optional[str] = None
+        self.stream_error_tail: list[str] = []
         self.active_download_context: dict = {}
 
         self.setWindowTitle(f"{APP_NAME} v{APP_VERSION}")
@@ -1720,8 +2052,8 @@ class MainWindow(QMainWindow):
         )
         tip(
             self.deps_header_btn,
-            "Проверка версий и обновление yt-dlp, FFmpeg, FFprobe и Deno.",
-            "Check versions and update yt-dlp, FFmpeg, FFprobe and Deno.",
+            "Проверка и обновление yt-dlp, Deno, FFmpeg/FFprobe и состояния Python runtime.",
+            "Check/update yt-dlp, Deno, FFmpeg/FFprobe and inspect the Python runtime.",
         )
         tip(
             self.language,
@@ -1879,7 +2211,13 @@ class MainWindow(QMainWindow):
 
     def startup_dependency_check(self):
         report = dependency_report()
-        required_ok = report["yt_dlp"]["ok"] and report["ffmpeg"]["ok"] and report["ffprobe"]["ok"]
+        required_ok = (
+            report["yt_dlp"]["ok"]
+            and report["yt_dlp"].get("external")
+            and report["ffmpeg"]["ok"]
+            and report["ffprobe"]["ok"]
+            and report["deno"]["ok"]
+        )
         if required_ok:
             return
         dlg = DependencyDialog(self, self.lang)
@@ -2288,6 +2626,8 @@ class MainWindow(QMainWindow):
         self.log.appendPlainText(text)
 
     def show_error(self, message: str):
+        if is_youtube_bot_error(message):
+            message = bot_error_help(self.lang)
         QMessageBox.critical(self, APP_NAME, message)
 
     def show_info(self, message: str):
@@ -2448,12 +2788,18 @@ class MainWindow(QMainWindow):
             self.settings.get("network_mode", "Auto"),
             self.settings.get("manual_proxy", ""),
         )
+        cert_suffix = ""
+        if self.session_certificate_override == "Insecure":
+            cert_suffix = " • TLS verification OFF"
+
         if resolved.proxy:
             self.connection_label.setText(
-                f"Connection: {resolved.name} • {resolved.detail}"
+                f"Connection: {resolved.name} • {resolved.detail}{cert_suffix}"
             )
         else:
-            self.connection_label.setText(f"Connection: {resolved.name}")
+            self.connection_label.setText(
+                f"Connection: {resolved.name}{cert_suffix}"
+            )
 
     def show_network_settings(self):
         dlg = NetworkDialog(self, self.settings)
@@ -2461,6 +2807,9 @@ class MainWindow(QMainWindow):
         if dlg.exec() == QDialog.Accepted:
             self.settings["network_mode"] = dlg.mode()
             self.settings["manual_proxy"] = dlg.proxy_edit.text().strip()
+            self.settings["certificate_mode"] = dlg.certificate_mode()
+            self.settings.update(dlg.cookie_settings())
+            self.session_certificate_override = None
             self.save_settings()
             self.update_connection_label()
             self.refresh_network_info()
@@ -2489,7 +2838,71 @@ class MainWindow(QMainWindow):
                 "yt-dlp не найден.\n\nЗапусти START-скрипт ещё раз или выполни:\n"
                 "python -m pip install -U yt-dlp"
             )
+        if cmd:
+            try:
+                cmd += cookie_args(self.settings)
+            except ValueError as exc:
+                self.show_error(str(exc))
+                return []
         return cmd
+
+    def effective_certificate_mode(self) -> str:
+        return str(
+            self.session_certificate_override
+            or self.settings.get("certificate_mode", "Auto")
+            or "Auto"
+        )
+
+    def current_certificate_env(self) -> dict[str, str]:
+        return certificate_process_env(self.effective_certificate_mode())
+
+    def offer_insecure_ssl_retry(self, *, analysis_url: str = "") -> bool:
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle(
+            "Проблема HTTPS-сертификата"
+            if self.lang == "RU"
+            else "HTTPS certificate problem"
+        )
+        box.setText(
+            (
+                "Не удалось проверить сертификат YouTube даже через доступные "
+                "хранилища сертификатов.\n\n"
+                "Это часто бывает при VPN, HTTPS-фильтрации или локальном proxy.\n\n"
+                "Повторить БЕЗ проверки сертификата только до закрытия программы?\n"
+                "Соединение будет зашифровано, но подлинность сервера проверяться не будет."
+            )
+            if self.lang == "RU"
+            else (
+                "The YouTube certificate could not be validated using the available "
+                "certificate stores.\n\n"
+                "This often happens with VPNs, HTTPS filtering or local proxies.\n\n"
+                "Retry WITHOUT certificate verification for this app session only?\n"
+                "Traffic remains encrypted, but server authenticity will not be verified."
+            )
+        )
+
+        retry_btn = box.addButton(
+            "Повторить без проверки SSL"
+            if self.lang == "RU"
+            else "Retry without SSL verification",
+            QMessageBox.AcceptRole,
+        )
+        cancel_btn = box.addButton(
+            self.tr("cancel"),
+            QMessageBox.RejectRole,
+        )
+        box.setDefaultButton(cancel_btn)
+        box.exec()
+
+        if box.clickedButton() == retry_btn:
+            self.session_certificate_override = "Insecure"
+            self.update_connection_label()
+            if analysis_url:
+                self.pending_ssl_retry_url = analysis_url
+            return True
+
+        return False
 
     def network_args(self) -> list[str]:
         args, resolved = proxy_args(
@@ -2523,7 +2936,8 @@ class MainWindow(QMainWindow):
             self.show_error(resolved.detail)
             return
 
-        cmd = base + net_args + ytdlp_common_args() + [
+        cert_mode = self.effective_certificate_mode()
+        cmd = base + net_args + ytdlp_common_args(cert_mode) + [
             "--socket-timeout", "6",
             "--extractor-retries", "1",
             "-J",
@@ -2538,7 +2952,12 @@ class MainWindow(QMainWindow):
         self.download_audio_btn.setEnabled(False)
         self.download_video_btn.setEnabled(False)
 
-        self.analyze_worker = CaptureWorker(cmd, app_dir(), timeout=20)
+        self.analyze_worker = CaptureWorker(
+            cmd,
+            app_dir(),
+            timeout=60 if self.settings.get("cookies_mode", "None") != "None" else 20,
+            extra_env=certificate_process_env(cert_mode),
+        )
         self.analyze_worker.completed.connect(self.analyze_completed)
         self.analyze_worker.failed.connect(self.analyze_failed)
         self.analyze_worker.finished.connect(self.analyze_finished)
@@ -2547,6 +2966,12 @@ class MainWindow(QMainWindow):
     def analyze_finished(self):
         self.analyze_worker = None
         self.analyze_btn.setText(self.tr("analyze"))
+
+        if self.pending_ssl_retry_url:
+            retry_url = self.pending_ssl_retry_url
+            self.pending_ssl_retry_url = None
+            self.url_edit.setText(retry_url)
+            QTimer.singleShot(0, self.analyze)
 
     def analyze_failed(self, error: str):
         self.show_error(error)
@@ -2560,12 +2985,33 @@ class MainWindow(QMainWindow):
 
         if code == 124:
             self.show_error(
-                "Анализ превысил 20 секунд. Проверь VPN/DNS/Proxy и попробуй ещё раз."
+                "Анализ превысил время ожидания. Проверь VPN/DNS/Proxy и доступ к cookies браузера, затем попробуй ещё раз."
             )
             self.video_title.setText(self.tr("not_analyzed"))
             return
         if code != 0:
-            self.show_error((err or out or "yt-dlp error")[-1600:])
+            all_text = (err or "") + "\n" + (out or "")
+            if is_ssl_certificate_error(all_text):
+                current_mode = self.effective_certificate_mode()
+
+                if current_mode != "Insecure":
+                    self.append_log(
+                        "SSL verify failed. Keychain/system CA could not validate the connection."
+                    )
+                    self.offer_insecure_ssl_retry(
+                        analysis_url=self.url_edit.text().strip()
+                    )
+                else:
+                    self.show_error(
+                        "Соединение не удалось даже с отключённой проверкой сертификата. "
+                        "Проверь VPN / proxy / интернет-соединение."
+                        if self.lang == "RU"
+                        else
+                        "Connection failed even with certificate verification disabled. "
+                        "Check VPN / proxy / network connectivity."
+                    )
+            else:
+                self.show_error((err or out or "yt-dlp error")[-1600:])
             self.video_title.setText(self.tr("not_analyzed"))
             return
 
@@ -2791,7 +3237,9 @@ class MainWindow(QMainWindow):
         if not resolved.ok:
             self.show_error(resolved.detail)
             return None
-        return base + net_args + ytdlp_common_args()
+        return base + net_args + ytdlp_common_args(
+            self.effective_certificate_mode()
+        )
 
     def show_completion_signal(self, kind: str, folder: str = ""):
         if kind == "audio":
@@ -2821,8 +3269,18 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self.progress.set_speed("—")
         self.active_download_context = context
+        self.stream_error_tail = []
         self.append_log("> " + " ".join(f'"{x}"' if " " in x else x for x in cmd))
-        self.stream_worker = StreamWorker(cmd, app_dir())
+
+        extra_env = {}
+        if context.get("kind") in {"audio", "video", "thumbnail"}:
+            extra_env = self.current_certificate_env()
+
+        self.stream_worker = StreamWorker(
+            cmd,
+            app_dir(),
+            extra_env=extra_env,
+        )
         self.stream_worker.line.connect(self.stream_line)
         self.stream_worker.completed.connect(self.stream_done)
         self.stream_worker.failed.connect(self.stream_failed)
@@ -2833,6 +3291,11 @@ class MainWindow(QMainWindow):
         if pct is not None:
             self.progress.setValue(pct)
             self.progress.set_speed(speed)
+
+        self.stream_error_tail.append(line)
+        if len(self.stream_error_tail) > 60:
+            del self.stream_error_tail[:-60]
+
         self.append_log(line)
 
     def stream_failed(self, error: str):
@@ -2843,6 +3306,25 @@ class MainWindow(QMainWindow):
         context = self.active_download_context
         self.stream_worker = None
         if code != 0:
+            tail_text = "\n".join(self.stream_error_tail)
+
+            if (
+                context.get("kind") in {"audio", "video", "thumbnail"}
+                and is_ssl_certificate_error(tail_text)
+                and self.effective_certificate_mode() != "Insecure"
+            ):
+                if self.offer_insecure_ssl_retry():
+                    self.show_error(
+                        "Проверка SSL отключена до закрытия программы. "
+                        "Нажми «Скачать» ещё раз."
+                        if self.lang == "RU"
+                        else
+                        "SSL verification is disabled until the app is closed. "
+                        "Click Download again."
+                    )
+                self.active_download_context = {}
+                return
+
             self.show_error("yt-dlp завершился с ошибкой. Смотри журнал событий.")
             self.active_download_context = {}
             return

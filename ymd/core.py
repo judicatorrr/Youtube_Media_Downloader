@@ -10,6 +10,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 import urllib.request
 import webbrowser
 import importlib.util
@@ -53,6 +54,10 @@ DEFAULT_SETTINGS = {
     "output_folder": str(Path.home() / "Downloads"),
     "network_mode": "Auto",
     "manual_proxy": "",
+    "certificate_mode": "Auto",
+    "cookies_mode": "None",
+    "cookies_browser": "chrome",
+    "cookies_file": "",
 }
 
 
@@ -128,8 +133,13 @@ def find_tool(tool: str) -> Optional[Path]:
     return None
 
 
+def external_ytdlp_path() -> Optional[Path]:
+    """Return a real yt-dlp executable/binary, not the Python module fallback."""
+    return find_tool("yt-dlp")
+
+
 def ytdlp_command() -> list[str]:
-    external = find_tool("yt-dlp")
+    external = external_ytdlp_path()
     if external:
         return [str(external)]
 
@@ -156,12 +166,29 @@ def python_command() -> list[str]:
 
 
 def dependency_report() -> dict:
+    external_yt = external_ytdlp_path()
     yt = ytdlp_command()
     ff = ffmpeg_path()
     fp = ffprobe_path()
     dn = deno_path()
+
+    python_version = platform.python_version()
+    python_recommended = sys.version_info >= (3, 11)
+
     return {
-        "yt_dlp": {"ok": bool(yt), "path": " ".join(yt) if yt else ""},
+        "python": {
+            "ok": True,
+            "recommended": python_recommended,
+            "version": python_version,
+            "path": sys.executable,
+            "frozen": bool(getattr(sys, "frozen", False)),
+        },
+        "yt_dlp": {
+            "ok": bool(yt),
+            "path": " ".join(yt) if yt else "",
+            "external": bool(external_yt),
+            "module_fallback": bool(yt and not external_yt),
+        },
         "ffmpeg": {"ok": bool(ff), "path": str(ff) if ff else ""},
         "ffprobe": {"ok": bool(fp), "path": str(fp) if fp else ""},
         "deno": {"ok": bool(dn), "path": str(dn) if dn else ""},
@@ -199,7 +226,156 @@ def deno_path() -> Optional[Path]:
     return find_tool("deno")
 
 
-def ytdlp_common_args() -> list[str]:
+
+def macos_keychain_ca_bundle(force: bool = False) -> Optional[Path]:
+    """
+    Create a PEM CA bundle that the OpenSSL runtime inside yt-dlp can read.
+
+    macOS Keychain trust is not always visible to standalone Python/OpenSSL.
+    Export public roots + System/login Keychains lazily and cache the bundle.
+    """
+    if platform.system() != "Darwin":
+        return None
+
+    cert_dir = user_config_dir() / "certs"
+    cert_dir.mkdir(parents=True, exist_ok=True)
+    bundle = cert_dir / "macos-keychain-ca.pem"
+
+    if bundle.exists() and not force:
+        try:
+            age = time.time() - bundle.stat().st_mtime
+            if age < 7 * 24 * 3600 and bundle.stat().st_size > 4096:
+                return bundle
+        except Exception:
+            pass
+
+    pem_blocks: list[bytes] = []
+
+    def add_pem_bytes(data: bytes) -> None:
+        if not data:
+            return
+        for match in re.finditer(
+            rb"-----BEGIN CERTIFICATE-----.*?-----END CERTIFICATE-----",
+            data,
+            flags=re.S,
+        ):
+            block = match.group(0).strip() + b"\n"
+            if block not in pem_blocks:
+                pem_blocks.append(block)
+
+    try:
+        import certifi
+        certifi_path = Path(certifi.where())
+        if certifi_path.exists():
+            add_pem_bytes(certifi_path.read_bytes())
+    except Exception:
+        pass
+
+    for system_bundle in (
+        Path("/etc/ssl/cert.pem"),
+        Path("/private/etc/ssl/cert.pem"),
+    ):
+        try:
+            if system_bundle.exists():
+                add_pem_bytes(system_bundle.read_bytes())
+        except Exception:
+            pass
+
+    security = shutil.which("security") or "/usr/bin/security"
+    keychains = [
+        Path("/System/Library/Keychains/SystemRootCertificates.keychain"),
+        Path("/Library/Keychains/System.keychain"),
+        Path.home() / "Library/Keychains/login.keychain-db",
+    ]
+
+    for keychain in keychains:
+        if not keychain.exists():
+            continue
+        try:
+            cp = subprocess.run(
+                [security, "find-certificate", "-a", "-p", str(keychain)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=20,
+            )
+            if cp.returncode == 0:
+                add_pem_bytes(cp.stdout)
+        except Exception:
+            pass
+
+    if not pem_blocks:
+        return None
+
+    tmp = bundle.with_suffix(".tmp")
+    tmp.write_bytes(b"\n".join(pem_blocks))
+    tmp.replace(bundle)
+    try:
+        bundle.chmod(0o600)
+    except Exception:
+        pass
+    return bundle
+
+
+def certificate_process_env(mode: str = "Auto") -> dict[str, str]:
+    """
+    Extra environment passed to yt-dlp.
+
+    Auto on macOS exports Apple Keychain certificates into SSL_CERT_FILE.
+    """
+    mode = str(mode or "Auto")
+    env: dict[str, str] = {}
+
+    if platform.system() == "Darwin" and mode in {"Auto", "MacKeychain"}:
+        bundle = macos_keychain_ca_bundle()
+        if bundle:
+            env["SSL_CERT_FILE"] = str(bundle)
+
+    return env
+
+
+def certificate_args(mode: str = "Auto") -> list[str]:
+    """
+    yt-dlp certificate strategy.
+
+    yt-dlp standalone builds bundle certifi. On macOS/Linux that can reject
+    a locally trusted CA (VPN / filtering proxy / organization certificate)
+    which the OS itself trusts. yt-dlp documents `no-certifi` specifically
+    for using system certificates.
+
+    Auto:
+      Windows -> bundled certifi (existing behavior)
+      macOS/Linux -> system certificate store
+    """
+    mode = str(mode or "Auto")
+
+    if mode in {"System", "MacKeychain"}:
+        return ["--compat-options", "no-certifi"]
+
+    if mode == "Certifi":
+        return []
+
+    if mode == "Insecure":
+        return ["--no-check-certificates"]
+
+    if mode == "Auto" and platform.system() in {"Darwin", "Linux"}:
+        return ["--compat-options", "no-certifi"]
+
+    return []
+
+
+def is_ssl_certificate_error(text: str) -> bool:
+    return bool(
+        re.search(
+            r"CERTIFICATE_VERIFY_FAILED|certificate verify failed|"
+            r"unable to get local issuer certificate|self signed certificate",
+            text or "",
+            flags=re.I,
+        )
+    )
+
+
+def ytdlp_common_args(certificate_mode: str = "Auto") -> list[str]:
     args = [
         "--ignore-config",
         "--no-playlist",
@@ -207,6 +383,8 @@ def ytdlp_common_args() -> list[str]:
         "--file-access-retries", "10",
         "--retry-sleep", "file_access:1",
     ]
+    args += certificate_args(certificate_mode)
+
     deno = deno_path()
     if deno:
         args += ["--js-runtimes", f"deno:{deno}"]
@@ -553,11 +731,18 @@ class CaptureWorker(QThread):
     completed = Signal(int, str, str)
     failed = Signal(str)
 
-    def __init__(self, cmd: list[str], cwd: Path | None = None, timeout: int | None = None):
+    def __init__(
+        self,
+        cmd: list[str],
+        cwd: Path | None = None,
+        timeout: int | None = None,
+        extra_env: Optional[dict[str, str]] = None,
+    ):
         super().__init__()
         self.cmd = cmd
         self.cwd = cwd
         self.timeout = timeout
+        self.extra_env = dict(extra_env or {})
         self.proc: Optional[subprocess.Popen] = None
 
     def cancel(self) -> None:
@@ -572,6 +757,7 @@ class CaptureWorker(QThread):
             env = os.environ.copy()
             env["PYTHONIOENCODING"] = "utf-8"
             env["PYTHONUTF8"] = "1"
+            env.update(self.extra_env)
             kwargs = {}
             if platform.system() == "Windows":
                 kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -604,10 +790,16 @@ class StreamWorker(QThread):
     completed = Signal(int)
     failed = Signal(str)
 
-    def __init__(self, cmd: list[str], cwd: Path | None = None):
+    def __init__(
+        self,
+        cmd: list[str],
+        cwd: Path | None = None,
+        extra_env: Optional[dict[str, str]] = None,
+    ):
         super().__init__()
         self.cmd = cmd
         self.cwd = cwd
+        self.extra_env = dict(extra_env or {})
         self.proc: Optional[subprocess.Popen] = None
         self._cancelled = False
 
@@ -624,6 +816,7 @@ class StreamWorker(QThread):
             env = os.environ.copy()
             env["PYTHONIOENCODING"] = "utf-8"
             env["PYTHONUTF8"] = "1"
+            env.update(self.extra_env)
             kwargs = {}
             if platform.system() == "Windows":
                 kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)

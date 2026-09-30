@@ -139,6 +139,11 @@ try {
 
     $venvPython = Join-Path $PSScriptRoot ".venv\Scripts\python.exe"
 
+    if ((Test-Path $venvPython) -and -not (Test-PythonExe $venvPython)) {
+        Write-Host "Old Python detected in .venv. Recreating environment..." -ForegroundColor Yellow
+        Remove-Item ".venv" -Recurse -Force
+    }
+
     if (-not (Test-Path $venvPython)) {
         Write-Host "Creating virtual environment..."
         & $python -m venv ".venv"

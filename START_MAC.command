@@ -55,6 +55,11 @@ fi
 
 echo "Python: $PYTHON_EXE"
 
+if [ -x ".venv/bin/python" ] && ! python_ok ".venv/bin/python"; then
+  echo "Old Python detected in .venv. Recreating environment..."
+  rm -rf .venv
+fi
+
 if [ ! -x ".venv/bin/python" ]; then
   "$PYTHON_EXE" -m venv .venv
 fi

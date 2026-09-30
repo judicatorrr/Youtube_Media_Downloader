@@ -8,13 +8,14 @@ import tempfile
 import time
 import json
 import re
+import ssl
 import subprocess
 import urllib.request
 import zipfile
 from pathlib import Path
 from typing import Callable, Optional
 
-from .core import app_dir, user_config_dir
+from .core import app_dir, user_config_dir, macos_keychain_ca_bundle
 
 ProgressCallback = Optional[Callable[[int, str], None]]
 LogCallback = Optional[Callable[[str], None]]
@@ -58,13 +59,54 @@ def local_bin_dir() -> Path:
     return target
 
 
-def _opener(proxy: str = ""):
+def _ssl_context(certificate_mode: str = "Auto") -> ssl.SSLContext:
+    """
+    SSL context for dependency downloads.
+
+    Important: the dependency updater downloads executable code (yt-dlp,
+    Deno, FFmpeg). Unlike ordinary YouTube requests, it must not silently
+    disable certificate verification.
+
+    On macOS Auto/MacKeychain reuse the same exported Keychain PEM bundle
+    as yt-dlp itself.
+    """
+    mode = str(certificate_mode or "Auto")
+
+    if mode == "Insecure":
+        # Explicit setting only. Never selected automatically.
+        return ssl._create_unverified_context()
+
+    if platform.system() == "Darwin" and mode in {"Auto", "MacKeychain"}:
+        bundle = macos_keychain_ca_bundle()
+        if bundle and bundle.exists():
+            return ssl.create_default_context(cafile=str(bundle))
+
+    if mode == "Certifi":
+        try:
+            import certifi
+            return ssl.create_default_context(cafile=certifi.where())
+        except Exception:
+            pass
+
+    # "System" and all other fallbacks.
+    return ssl.create_default_context()
+
+
+def _opener(proxy: str = "", certificate_mode: str = "Auto"):
     proxy = (proxy or "").strip()
+    handlers = []
+
     if proxy.lower().startswith(("http://", "https://")):
-        return urllib.request.build_opener(
+        handlers.append(
             urllib.request.ProxyHandler({"http": proxy, "https": proxy})
         )
-    return urllib.request.build_opener()
+
+    handlers.append(
+        urllib.request.HTTPSHandler(
+            context=_ssl_context(certificate_mode)
+        )
+    )
+    return urllib.request.build_opener(*handlers)
 
 
 
@@ -99,8 +141,13 @@ def _version_tuple(text: str) -> tuple[int, ...]:
         return ()
 
 
-def _read_url_text(url: str, proxy: str = "", timeout: int = 10) -> str:
-    opener = _opener(proxy)
+def _read_url_text(
+    url: str,
+    proxy: str = "",
+    timeout: int = 10,
+    certificate_mode: str = "Auto",
+) -> str:
+    opener = _opener(proxy, certificate_mode)
     request = urllib.request.Request(
         url,
         headers={
@@ -133,7 +180,11 @@ def _command_first_line(command: list[str]) -> str:
         return ""
 
 
-def check_dependency_updates(report: dict, proxy: str = "") -> dict:
+def check_dependency_updates(
+    report: dict,
+    proxy: str = "",
+    certificate_mode: str = "Auto",
+) -> dict:
     """
     Return update metadata for installed dependencies.
 
@@ -148,6 +199,7 @@ def check_dependency_updates(report: dict, proxy: str = "") -> dict:
             raw = _read_url_text(
                 "https://api.github.com/repos/yt-dlp/yt-dlp/releases/latest",
                 proxy,
+                certificate_mode=certificate_mode,
             )
             latest = str(json.loads(raw).get("tag_name") or "").lstrip("v")
             current = _command_first_line(
@@ -169,6 +221,7 @@ def check_dependency_updates(report: dict, proxy: str = "") -> dict:
             raw = _read_url_text(
                 "https://api.github.com/repos/denoland/deno/releases/latest",
                 proxy,
+                certificate_mode=certificate_mode,
             )
             latest = str(json.loads(raw).get("tag_name") or "").lstrip("v")
             line = _command_first_line([report["deno"]["path"], "--version"])
@@ -186,7 +239,11 @@ def check_dependency_updates(report: dict, proxy: str = "") -> dict:
     # FFmpeg and FFprobe share the same upstream release version.
     if report.get("ffmpeg", {}).get("ok") or report.get("ffprobe", {}).get("ok"):
         try:
-            html = _read_url_text("https://ffmpeg.org/releases/", proxy)
+            html = _read_url_text(
+                "https://ffmpeg.org/releases/",
+                proxy,
+                certificate_mode=certificate_mode,
+            )
             versions = re.findall(
                 r"ffmpeg-(\d+\.\d+(?:\.\d+)?)\.tar\.(?:xz|bz2|gz)",
                 html,
@@ -218,11 +275,18 @@ def check_dependency_updates(report: dict, proxy: str = "") -> dict:
     return result
 
 
-def download_file(url: str, destination: Path, proxy: str = "", progress_cb: ProgressCallback = None, log_cb: LogCallback = None) -> Path:
+def download_file(
+    url: str,
+    destination: Path,
+    proxy: str = "",
+    progress_cb: ProgressCallback = None,
+    log_cb: LogCallback = None,
+    certificate_mode: str = "Auto",
+) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     _log(log_cb, f"GET {url}")
     request = urllib.request.Request(url, headers={"User-Agent": "YouTube-Media-Downloader/2", "Accept": "*/*"})
-    opener = _opener(proxy)
+    opener = _opener(proxy, certificate_mode)
     with opener.open(request, timeout=60) as response:
         try:
             total = int(response.headers.get("Content-Length") or 0)
@@ -302,7 +366,12 @@ def _replace_download(temp_path: Path, final_path: Path) -> None:
     _make_executable(final_path)
 
 
-def install_ytdlp(proxy: str = "", progress_cb: ProgressCallback = None, log_cb: LogCallback = None) -> list[Path]:
+def install_ytdlp(
+    proxy: str = "",
+    progress_cb: ProgressCallback = None,
+    log_cb: LogCallback = None,
+    certificate_mode: str = "Auto",
+) -> list[Path]:
     system = platform_key()
     arch = arch_key()
     target_dir = local_bin_dir()
@@ -325,7 +394,10 @@ def install_ytdlp(proxy: str = "", progress_cb: ProgressCallback = None, log_cb:
     url = f"https://github.com/yt-dlp/yt-dlp/releases/latest/download/{asset}"
     with tempfile.TemporaryDirectory(prefix="ymd_ytdlp_") as td:
         temp = Path(td) / asset
-        download_file(url, temp, proxy, progress_cb, log_cb)
+        download_file(
+            url, temp, proxy, progress_cb, log_cb,
+            certificate_mode=certificate_mode,
+        )
         _replace_download(temp, final)
     _log(log_cb, f"yt-dlp → {final}")
     return [final]
@@ -351,13 +423,21 @@ def _deno_asset() -> tuple[str, str]:
     raise RuntimeError(f"Автообновление Deno не настроено для {system}/{arch}.")
 
 
-def install_deno(proxy: str = "", progress_cb: ProgressCallback = None, log_cb: LogCallback = None) -> list[Path]:
+def install_deno(
+    proxy: str = "",
+    progress_cb: ProgressCallback = None,
+    log_cb: LogCallback = None,
+    certificate_mode: str = "Auto",
+) -> list[Path]:
     asset, binary = _deno_asset()
     target = local_bin_dir() / binary
     url = f"https://github.com/denoland/deno/releases/latest/download/{asset}"
     with tempfile.TemporaryDirectory(prefix="ymd_deno_") as td:
         archive = Path(td) / asset
-        download_file(url, archive, proxy, progress_cb, log_cb)
+        download_file(
+            url, archive, proxy, progress_cb, log_cb,
+            certificate_mode=certificate_mode,
+        )
         extracted = Path(td) / binary
         _extract_named_from_zip(archive, binary, extracted)
         _replace_download(extracted, target)
@@ -380,7 +460,12 @@ def _ffmpeg_urls() -> tuple[str, str, str]:
     raise RuntimeError(f"Автозагрузка FFmpeg не настроена для {system}/{arch}.")
 
 
-def install_ffmpeg_pair(proxy: str = "", progress_cb: ProgressCallback = None, log_cb: LogCallback = None) -> list[Path]:
+def install_ffmpeg_pair(
+    proxy: str = "",
+    progress_cb: ProgressCallback = None,
+    log_cb: LogCallback = None,
+    certificate_mode: str = "Auto",
+) -> list[Path]:
     kind, first_url, second_url = _ffmpeg_urls()
     target_dir = local_bin_dir()
     exe = ".exe" if platform_key() == "windows" else ""
@@ -391,7 +476,10 @@ def install_ffmpeg_pair(proxy: str = "", progress_cb: ProgressCallback = None, l
         td = Path(td_name)
         if kind == "windows_bundle":
             archive = td / "ffmpeg.zip"
-            download_file(first_url, archive, proxy, progress_cb, log_cb)
+            download_file(
+                first_url, archive, proxy, progress_cb, log_cb,
+                certificate_mode=certificate_mode,
+            )
             tmp_ffmpeg = td / f"ffmpeg{exe}"
             tmp_ffprobe = td / f"ffprobe{exe}"
             _extract_named_from_zip(archive, f"ffmpeg{exe}", tmp_ffmpeg)
@@ -402,12 +490,26 @@ def install_ffmpeg_pair(proxy: str = "", progress_cb: ProgressCallback = None, l
             ff_archive = td / "ffmpeg.zip"
             fp_archive = td / "ffprobe.zip"
             _log(log_cb, "FFmpeg: 1/2")
-            download_file(first_url, ff_archive, proxy, lambda p, t: _progress(progress_cb, int(p * 0.5), "FFmpeg"), log_cb)
+            download_file(
+                first_url,
+                ff_archive,
+                proxy,
+                lambda p, t: _progress(progress_cb, int(p * 0.5), "FFmpeg"),
+                log_cb,
+                certificate_mode=certificate_mode,
+            )
             tmp_ffmpeg = td / f"ffmpeg{exe}"
             _extract_named_from_zip(ff_archive, f"ffmpeg{exe}", tmp_ffmpeg)
             _replace_download(tmp_ffmpeg, ffmpeg_out)
             _log(log_cb, "FFprobe: 2/2")
-            download_file(second_url, fp_archive, proxy, lambda p, t: _progress(progress_cb, 50 + int(p * 0.5), "FFprobe"), log_cb)
+            download_file(
+                second_url,
+                fp_archive,
+                proxy,
+                lambda p, t: _progress(progress_cb, 50 + int(p * 0.5), "FFprobe"),
+                log_cb,
+                certificate_mode=certificate_mode,
+            )
             tmp_ffprobe = td / f"ffprobe{exe}"
             _extract_named_from_zip(fp_archive, f"ffprobe{exe}", tmp_ffprobe)
             _replace_download(tmp_ffprobe, ffprobe_out)
@@ -418,11 +520,26 @@ def install_ffmpeg_pair(proxy: str = "", progress_cb: ProgressCallback = None, l
     return [ffmpeg_out, ffprobe_out]
 
 
-def install_dependency(key: str, proxy: str = "", progress_cb: ProgressCallback = None, log_cb: LogCallback = None) -> list[Path]:
+def install_dependency(
+    key: str,
+    proxy: str = "",
+    progress_cb: ProgressCallback = None,
+    log_cb: LogCallback = None,
+    certificate_mode: str = "Auto",
+) -> list[Path]:
     if key == "yt_dlp":
-        return install_ytdlp(proxy, progress_cb, log_cb)
+        return install_ytdlp(
+            proxy, progress_cb, log_cb,
+            certificate_mode=certificate_mode,
+        )
     if key in {"ffmpeg", "ffprobe"}:
-        return install_ffmpeg_pair(proxy, progress_cb, log_cb)
+        return install_ffmpeg_pair(
+            proxy, progress_cb, log_cb,
+            certificate_mode=certificate_mode,
+        )
     if key == "deno":
-        return install_deno(proxy, progress_cb, log_cb)
+        return install_deno(
+            proxy, progress_cb, log_cb,
+            certificate_mode=certificate_mode,
+        )
     raise RuntimeError(f"Неизвестная зависимость: {key}")

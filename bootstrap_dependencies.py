@@ -17,14 +17,17 @@ def main() -> int:
 
     jobs: list[tuple[str, str]] = []
 
-    if not report["yt_dlp"]["ok"]:
-        jobs.append(("yt_dlp", "yt-dlp"))
+    # Prefer the official platform binary even if the Python package is
+    # available in the venv. This decouples yt-dlp from the app's Python
+    # runtime and avoids Python-version warnings in source builds.
+    if not report["yt_dlp"].get("external"):
+        jobs.append(("yt_dlp", "yt-dlp (official platform binary)"))
 
     if not report["ffmpeg"]["ok"] or not report["ffprobe"]["ok"]:
         jobs.append(("ffmpeg", "FFmpeg + FFprobe"))
 
     if not report["deno"]["ok"]:
-        jobs.append(("deno", "Deno"))
+        jobs.append(("deno", "Deno JS runtime"))
 
     if not jobs:
         print("All dependencies are already installed.")
