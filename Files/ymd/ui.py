@@ -54,6 +54,11 @@ from . import APP_NAME, APP_VERSION
 from .auth import BROWSERS, cookie_args, is_youtube_bot_error, bot_error_help
 from .dependencies import install_dependency, check_dependency_updates, _ssl_context
 
+try:
+    from mutagen.mp4 import MP4
+except Exception:
+    MP4 = None
+
 from .skins import SKIN_ORDER, get_skin
 
 from .chapters import (
@@ -72,6 +77,8 @@ from .core import (
     video_container_compatible,
     audio_container_compatible,
     container_has_4k,
+    ipod_classic_6g_video_compatible,
+    ipod_classic_6g_audio_compatible,
     CaptureWorker,
     clear_tool_cache,
     certificate_process_env,
@@ -598,6 +605,104 @@ class PostProcessWorker(QThread):
                 cp = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
                 ok = cp.returncode == 0 and out.exists()
                 self.done.emit(ok, str(out), cp.stderr.decode("utf-8", "replace"))
+                return
+
+            if self.action == "ipod6g":
+                ffmpeg = Path(self.kwargs["ffmpeg"])
+                out = Path(self.kwargs["output"])
+                merged = self.kwargs.get("input")
+                video_input = self.kwargs.get("video_input")
+                audio_input = self.kwargs.get("audio_input")
+                total_duration = float(self.kwargs.get("duration") or 0.0)
+
+                # Conservative iPod classic 6G preset. Preserve aspect ratio, never upscale,
+                # force even dimensions, cap frame rate, and keep bitrate below Apple's ceiling.
+                vf = "scale=w='min(640,iw)':h='min(480,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2"
+                cmd = [str(ffmpeg), "-hide_banner", "-loglevel", "error", "-y"]
+                if video_input and audio_input:
+                    cmd += ["-i", str(Path(video_input)), "-i", str(Path(audio_input)),
+                            "-map", "0:v:0", "-map", "1:a:0"]
+                else:
+                    inp = Path(merged)
+                    cmd += ["-i", str(inp), "-map", "0:v:0", "-map", "0:a:0",
+                            "-map_metadata", "0", "-map_chapters", "0"]
+                cmd += [
+                    "-vf", vf, "-fpsmax", "30",
+                    "-c:v", "libx264", "-profile:v", "baseline", "-level:v", "3.0",
+                    "-pix_fmt", "yuv420p", "-b:v", "2000k", "-maxrate", "2500k", "-bufsize", "5000k",
+                    "-c:a", "aac", "-profile:a", "aac_low", "-b:a", "160k", "-ar", "48000", "-ac", "2",
+                    "-movflags", "+faststart",
+                    "-progress", "pipe:1", "-nostats",
+                    str(out),
+                ]
+
+                def fmt_time(seconds: float) -> str:
+                    seconds = max(0, int(seconds or 0))
+                    h, rem = divmod(seconds, 3600)
+                    m, sec = divmod(rem, 60)
+                    return f"{h:d}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
+
+                def emit_bar(percent: int, current_seconds: float = 0.0, speed: str = ""):
+                    percent = max(0, min(100, int(percent)))
+                    width = 30
+                    filled = int(round(width * percent / 100.0))
+                    bar = "#" * filled + "-" * (width - filled)
+                    timing = ""
+                    if total_duration > 0:
+                        timing = f" | {fmt_time(current_seconds)} / {fmt_time(total_duration)}"
+                    speed_text = f" | {speed}" if speed else ""
+                    self.log.emit(f"[iPod] [{bar}] {percent:3d}%{timing}{speed_text}")
+                    self.progress.emit(percent)
+
+                self.log.emit("[iPod] FFmpeg: H.264 Baseline + AAC-LC conversion started")
+                emit_bar(0, 0.0)
+                kwargs = {}
+                if platform.system() == "Windows":
+                    kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                proc = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    universal_newlines=True,
+                    **kwargs,
+                )
+                last_percent = -1
+                current_seconds = 0.0
+                current_speed = ""
+                if proc.stdout is not None:
+                    for raw in proc.stdout:
+                        line = raw.strip()
+                        if "=" not in line:
+                            continue
+                        key, value = line.split("=", 1)
+                        if key in {"out_time_us", "out_time_ms"}:
+                            try:
+                                current_seconds = float(value) / 1_000_000.0
+                            except Exception:
+                                pass
+                        elif key == "speed":
+                            current_speed = value.strip()
+                        elif key == "progress":
+                            if value == "end":
+                                pct = 100
+                            elif total_duration > 0:
+                                pct = int(min(99, (current_seconds / total_duration) * 100))
+                            else:
+                                pct = last_percent if last_percent >= 0 else 0
+                            # Journal gets a stable ASCII bar instead of hundreds of ffmpeg lines.
+                            # Update at 2% steps (plus the final 100%).
+                            if pct == 100 or pct >= last_percent + 2:
+                                emit_bar(pct, current_seconds, current_speed)
+                                last_percent = pct
+                stderr_text = proc.stderr.read() if proc.stderr is not None else ""
+                code = proc.wait()
+                ok = code == 0 and out.exists()
+                if ok and last_percent < 100:
+                    emit_bar(100, total_duration or current_seconds, current_speed)
+                self.done.emit(ok, str(out), stderr_text)
                 return
 
             if self.action == "embed_chapters":
@@ -1776,7 +1881,30 @@ class MainWindow(QMainWindow):
         self.video_title.setObjectName("videoTitle")
         result_row.addWidget(self.preview_label)
         result_row.addWidget(self.video_title, 1)
-        source_layout.addLayout(result_row, 2, 0, 1, 3)
+        source_layout.addLayout(result_row, 2, 0, 1, 2)
+
+        # Keep the global progress visible next to the source/output controls.
+        # This avoids losing it below the fold when the app is not maximized.
+        progress_card = QFrame()
+        progress_card.setObjectName("commonProgressCard")
+        progress_outer = QVBoxLayout(progress_card)
+        progress_outer.setContentsMargins(11, 7, 11, 8)
+        progress_outer.setSpacing(4)
+
+        self.progress_title = QLabel()
+        self.progress_title.setObjectName("commonProgressTitle")
+        progress_outer.addWidget(self.progress_title)
+
+        progress_row = QHBoxLayout()
+        progress_row.setSpacing(9)
+        self.progress = OverallProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
+        self.progress.setMinimumHeight(30)
+        progress_row.addWidget(self.progress, 1)
+        progress_outer.addLayout(progress_row)
+        source_layout.addWidget(progress_card, 2, 2)
+
         root.addWidget(source_card)
 
         # Two independent, top-aligned columns.
@@ -1815,19 +1943,19 @@ class MainWindow(QMainWindow):
         audio_labels = QHBoxLayout()
         self.audio_format_label = QLabel()
         self.audio_variant_label = QLabel()
-        audio_labels.addWidget(self.audio_format_label, 2)
-        audio_labels.addWidget(self.audio_variant_label, 5)
+        audio_labels.addWidget(self.audio_format_label, 1)
+        audio_labels.addWidget(self.audio_variant_label, 1)
         a.addLayout(audio_labels)
         audio_row = QHBoxLayout()
         self.audio_container_combo = ChevronComboBox()
-        self.audio_container_combo.setMinimumWidth(92)
+        self.audio_container_combo.setMinimumWidth(180)
         self.audio_container_combo.currentIndexChanged.connect(self.update_audio_variants)
         self.audio_combo = ChevronComboBox()
         self.audio_combo.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         self.audio_combo.setMinimumWidth(150)
         self.audio_combo.currentIndexChanged.connect(self.audio_selection_changed)
-        audio_row.addWidget(self.audio_container_combo, 2)
-        audio_row.addWidget(self.audio_combo, 5)
+        audio_row.addWidget(self.audio_container_combo, 1)
+        audio_row.addWidget(self.audio_combo, 1)
         a.addLayout(audio_row)
 
         checks = QVBoxLayout()
@@ -1964,6 +2092,16 @@ class MainWindow(QMainWindow):
         container_row.addStretch(1)
         v.addLayout(container_row)
 
+        self.ipod_compat = QCheckBox()
+        self.ipod_compat.setChecked(False)
+        self.ipod_compat.toggled.connect(self.ipod_compat_toggled)
+        v.addWidget(self.ipod_compat)
+        self.ipod_hint = QLabel()
+        self.ipod_hint.setProperty("muted", True)
+        self.ipod_hint.setWordWrap(True)
+        self.ipod_hint.setVisible(False)
+        v.addWidget(self.ipod_hint)
+
         self.video_stream_label = QLabel()
         self.video_stream_label.setObjectName("keyLabel")
         v.addWidget(self.video_stream_label)
@@ -2075,32 +2213,6 @@ class MainWindow(QMainWindow):
 
         right_col.addWidget(self.fragment_group)
 
-        # Overall progress is outside both columns. It stays global and
-        # always starts below whichever column is currently taller.
-
-        progress_card = QFrame()
-        progress_card.setObjectName("commonProgressCard")
-        progress_outer = QVBoxLayout(progress_card)
-        progress_outer.setContentsMargins(11, 8, 11, 9)
-        progress_outer.setSpacing(5)
-
-        self.progress_title = QLabel()
-        self.progress_title.setObjectName("commonProgressTitle")
-        progress_outer.addWidget(self.progress_title)
-
-        progress_row = QHBoxLayout()
-        progress_row.setSpacing(9)
-
-        self.progress = OverallProgressBar()
-        self.progress.setRange(0, 100)
-        self.progress.setValue(0)
-        self.progress.setMinimumHeight(34)
-
-        progress_row.addWidget(self.progress, 1)
-        progress_outer.addLayout(progress_row)
-
-        root.addWidget(progress_card)
-
         # Journal card.
         self.log_group = CollapsibleGroup()
         self.log_group.setObjectName("journalCard")
@@ -2198,6 +2310,17 @@ class MainWindow(QMainWindow):
             "🎬  СКАЧАТЬ ВИДЕО" if self.lang == "RU" else "🎬  DOWNLOAD VIDEO"
         )
         self.container_label.setText(self.tr("container"))
+        self.ipod_compat.setText("Подготовить для iPod Classic 6G" if self.lang == "RU" else "Prepare for iPod Classic 6G")
+        self.ipod_compat.setToolTip(
+            "Берёт выбранный исходник до 1080p и перекодирует в совместимый MP4: H.264 Baseline ≤ 640×480 / 30 fps + AAC-LC 160 kbps."
+            if self.lang == "RU" else
+            "Uses the selected source up to 1080p and converts it to a compatible MP4: H.264 Baseline ≤ 640×480 / 30 fps + AAC-LC 160 kbps."
+        )
+        self.ipod_hint.setText(
+            "H.264 Baseline · до 640×480 · до 30 fps · AAC-LC 160 kbps · источник максимум 1080p"
+            if self.lang == "RU" else
+            "H.264 Baseline · up to 640×480 · up to 30 fps · AAC-LC 160 kbps · source capped at 1080p"
+        )
         self.video_stream_label.setText("2. Качество" if self.lang == "RU" else "2. Quality")
         self.resolution_label.setText("Разрешение" if self.lang == "RU" else "Resolution")
         self.variant_label.setText("Вариант потока" if self.lang == "RU" else "Stream variant")
@@ -2472,13 +2595,13 @@ class MainWindow(QMainWindow):
         ext = entry[1] if entry else ""
         raw = ext == ".aac"
         tip(self.audio_track_combo, "Выбери оригинал или дубляж по языку.", "Choose the original track or a dub by language.")
-        tip(self.audio_container_combo, "OPUS → .opus / .ogg; AAC → .m4a / .aac. Без перекодирования.", "OPUS → .opus / .ogg; AAC → .m4a / .aac. No transcoding.")
+        tip(self.audio_container_combo, "Opus → AAC 320 (.m4a): для iTunes/iPod, с перекодированием. Остальные варианты — без перекодирования.", "Opus → AAC 320 (.m4a): for iTunes/iPod, transcoded. Other options do not transcode.")
         tip(self.audio_combo, "Битрейт и частота исходного потока. DRC — сжатый динамический диапазон.", "Source bitrate and sample rate. DRC means compressed dynamic range.")
         tip(self.audio_meta, "В .aac/ADTS метаданные не встраиваются; выбери M4A." if raw else "Добавить название, автора и другие метаданные.", "AAC/ADTS cannot embed tags; choose M4A." if raw else "Add title, author and other metadata.")
         tip(self.audio_thumb, "В .aac/ADTS обложка не встраивается; выбери M4A." if raw else "Встроить обложку в аудиофайл.", "AAC/ADTS cannot embed a cover; choose M4A." if raw else "Embed the cover in the audio file.")
-        tip(self.ch_embed, "Встроенные главы доступны только в M4A. Для Opus/OGG/AAC используй разделение на треки.", "Embedded chapters require M4A. For Opus/OGG/AAC, split into tracks.")
+        tip(self.ch_embed, "Главы встраиваются в M4A, включая AAC 320 из Opus. Для .opus/.ogg/.aac используй разделение на треки.", "Chapters can be embedded in M4A, including AAC 320 from Opus. For .opus/.ogg/.aac, split into tracks.")
         tip(self.audio_manual_btn, "Сначала выбери встраивание глав или разделение на треки." if self.ch_none.isChecked() else "Введи таймкоды: 00:00 Название.", "First select chapter embedding or track splitting." if self.ch_none.isChecked() else "Enter timestamps: 00:00 Title.")
-        tip(self.download_audio_btn, "Сначала проанализируй ссылку и выбери аудиопоток." if not entry else "Скачать выбранную дорожку без перекодирования.", "Analyze a link and select an audio stream first." if not entry else "Download the selected track without transcoding.")
+        tip(self.download_audio_btn, "Сначала проанализируй ссылку и выбери аудиопоток." if not entry else ("Скачать выбранный Opus и преобразовать в AAC-LC 320 кбит/с (.m4a) для iTunes/iPod." if ext == "opus_aac320" else "Скачать выбранную дорожку без перекодирования."), "Analyze a link and select an audio stream first." if not entry else ("Download the selected Opus and convert to AAC-LC 320 kbps (.m4a) for iTunes/iPod." if ext == "opus_aac320" else "Download the selected track without transcoding."))
         tip(self.mp4, "MP4: H.264/AV1 + AAC. Другие потоки доступны в MKV/WebM.", "MP4: H.264/AV1 + AAC. Other streams are available in MKV/WebM.")
         tip(self.mkv, "MKV: H.264/VP9/AV1 + AAC/Opus.", "MKV: H.264/VP9/AV1 + AAC/Opus.")
         tip(self.webm, "WebM: VP9/AV1 + Opus. H.264/AAC несовместимы.", "WebM: VP9/AV1 + Opus. H.264/AAC are incompatible.")
@@ -3443,7 +3566,7 @@ class MainWindow(QMainWindow):
         self.audio_container_combo.clear()
         first_selectable = -1
         for heading, codec, choices in (
-            ("OPUS", "Opus", [("    ├ .opus", ".opus"), ("    └ .ogg", ".ogg")]),
+            ("OPUS", "Opus", [("    ├ .opus", ".opus"), ("    ├ .ogg", ".ogg"), ("    └ AAC 320 (.m4a)", "opus_aac320")]),
             ("AAC", "AAC", [("    ├ .m4a", ".m4a"), ("    └ .aac", ".aac")]),
         ):
             if not any(f.codec == codec for f in group):
@@ -3456,7 +3579,7 @@ class MainWindow(QMainWindow):
                     first_selectable = self.audio_container_combo.count()
                 self.audio_container_combo.addItem(name, ext)
                 hint = {".opus": "Opus в контейнере Ogg.", ".ogg": "Opus в контейнере Ogg, расширение .ogg.", ".m4a": "AAC в MP4: метаданные, обложка и главы.", ".aac": "AAC/ADTS: без метаданных, обложки и встроенных глав."} if self.lang == "RU" else {".opus": "Opus in an Ogg container.", ".ogg": "Opus in Ogg, with the .ogg extension.", ".m4a": "AAC in MP4: tags, cover and chapters.", ".aac": "AAC/ADTS: no tags, cover or embedded chapters."}
-                self.audio_container_combo.setItemData(self.audio_container_combo.count()-1, hint[ext], Qt.ToolTipRole)
+                self.audio_container_combo.setItemData(self.audio_container_combo.count()-1, hint.get(ext, "Для iTunes/iPod: Opus → AAC-LC 320 кбит/с, M4A. С перекодированием." if self.lang == "RU" else "For iTunes/iPod: Opus → AAC-LC 320 kbps, M4A. Transcoded."), Qt.ToolTipRole)
         index = self.audio_container_combo.findData(preferred_ext) if preferred_ext else -1
         self.audio_container_combo.setCurrentIndex(index if index >= 0 else first_selectable)
         self.audio_container_combo.blockSignals(False)
@@ -3467,7 +3590,7 @@ class MainWindow(QMainWindow):
             return
         ext = self.audio_container_combo.currentData()
         group = getattr(self, "audio_track_groups", {}).get(self.audio_track_combo.currentData(), [])
-        codec = "Opus" if ext in {".opus", ".ogg"} else "AAC"
+        codec = "Opus" if ext in {".opus", ".ogg", "opus_aac320"} else "AAC"
         streams = sorted([f for f in group if f.codec == codec], key=audio_preference_key)
         self.audio_combo.blockSignals(True)
         self.audio_combo.clear()
@@ -3476,8 +3599,11 @@ class MainWindow(QMainWindow):
             rate = f"~{fmt.abr:g} kbps" if fmt.abr else fmt.codec
             sample = f"{fmt.asr / 1000:g} kHz" if fmt.asr else ""
             size = "≈" + format_bytes(fmt.size) if fmt.size else ""
-            self.audio_combo.addItem(" · ".join(x for x in (rate, sample, size, "DRC" if fmt.is_drc else "") if x))
-            self.audio_combo.setItemData(self.audio_combo.count()-1, audio_display_label(fmt, self.lang) + f" • id {fmt.id}", Qt.ToolTipRole)
+            parts = (rate, sample, size, "DRC" if fmt.is_drc else "")
+            if ext == "opus_aac320":
+                parts = (rate, sample, "DRC" if fmt.is_drc else "")
+            self.audio_combo.addItem(" · ".join(x for x in parts if x))
+            self.audio_combo.setItemData(self.audio_combo.count()-1, audio_display_label(fmt, self.lang) + f" • id {fmt.id}" + (" → AAC 320 (.m4a)" if ext == "opus_aac320" else ""), Qt.ToolTipRole)
         index = next((i for i,fmt in enumerate(streams) if fmt.id == preferred_id), 0)
         self.audio_combo.setCurrentIndex(index if streams else -1)
         self.audio_combo.blockSignals(False)
@@ -3488,10 +3614,10 @@ class MainWindow(QMainWindow):
         if idx < 0 or idx >= len(self.audio_map) or self.audio_map[idx] is None:
             return
         fmt, ext = self.audio_map[idx]
-        self.ch_embed.setEnabled(ext == ".m4a")
+        self.ch_embed.setEnabled(ext in {".m4a", "opus_aac320"})
         preference = self.audio_chapter_preference
         if preference == "embed":
-            (self.ch_embed if ext == ".m4a" else self.ch_none).setChecked(True)
+            (self.ch_embed if ext in {".m4a", "opus_aac320"} else self.ch_none).setChecked(True)
         elif preference == "split":
             self.ch_split.setChecked(True)
         else:
@@ -3515,6 +3641,16 @@ class MainWindow(QMainWindow):
         self.audio_manual_btn.setEnabled(not self.ch_none.isChecked())
         self.refresh_context_help()
 
+    def ipod_compat_toggled(self, checked: bool):
+        # iPod mode is a conversion preset, not a direct-play stream filter.
+        # Keep MP4 locked as the final container and show source streams up to 1080p.
+        self.mkv.setEnabled(not checked)
+        self.webm.setEnabled(not checked)
+        self.ipod_hint.setVisible(checked)
+        if checked and not self.mp4.isChecked():
+            self.mp4.setChecked(True)
+        self.update_video_choices()
+
     def selected_container(self) -> str:
         if self.mkv.isChecked():
             return "MKV"
@@ -3527,16 +3663,21 @@ class MainWindow(QMainWindow):
             return
         container = self.selected_container()
 
+        ipod_mode = bool(getattr(self, "ipod_compat", None) is not None and self.ipod_compat.isChecked())
         for name, badge in self.container_badges.items():
-            available = container_has_4k(self.video_formats, self.audio_formats, name)
+            available = (not ipod_mode) and container_has_4k(self.video_formats, self.audio_formats, name)
             badge.setText("4K" if available else "")
             badge.setToolTip(("Доступен совместимый поток 4K" if self.lang == "RU" else "Compatible 4K stream available") if available else "")
 
-        vids = [v for v in self.video_formats if video_container_compatible(v, container)]
-        auds = sorted(
-            [a for a in self.audio_formats if audio_container_compatible(a, container)],
-            key=audio_preference_key,
-        )
+        if ipod_mode:
+            # This is a transcode preset: source codec/container do not need to be iPod-compatible.
+            # 1080p is the intentional ceiling; downloading 1440p/4K brings no useful benefit for a 640px target.
+            vids = [v for v in self.video_formats if (v.height or 0) <= 1080 and (v.height or 0) > 0]
+            auds = list(self.audio_formats)
+        else:
+            vids = [v for v in self.video_formats if video_container_compatible(v, container)]
+            auds = [a for a in self.audio_formats if audio_container_compatible(a, container)]
+        auds = sorted(auds, key=audio_preference_key)
         self.filtered_video_audio = auds
 
         previous = self.selected_video_entry()
@@ -3678,6 +3819,8 @@ class MainWindow(QMainWindow):
         self.progress.set_speed("—")
         self.active_download_context = context
         self.stream_error_tail = []
+        if context.get("transcode_aac320"):
+            self.append_log("Opus → AAC-LC 320 кбит/с · M4A · 44,1 кГц · стерео · для iTunes/iPod" if self.lang == "RU" else "Opus → AAC-LC 320 kbps · M4A · 44.1 kHz · stereo · for iTunes/iPod")
         self.append_log("> " + " ".join(f'"{x}"' if " " in x else x for x in cmd))
 
         extra_env = {}
@@ -3715,6 +3858,16 @@ class MainWindow(QMainWindow):
         self.stream_worker = None
         if code != 0:
             tail_text = "\n".join(self.stream_error_tail)
+
+            # iPod mode only needs the downloaded elementary streams. Some YouTube
+            # combinations (for example HLS MP4 video + WebM/Opus audio) can make
+            # yt-dlp's temporary merger fail even though both source files are valid.
+            # If they are present, bypass that failed merge and feed them directly
+            # to our final H.264/AAC iPod conversion.
+            if context.get("kind") == "video" and context.get("ipod_mode"):
+                if self.start_ipod_conversion_from_sources(context):
+                    self.append_log("Промежуточное объединение yt-dlp не удалось, но оба потока скачаны. Продолжаю конвертацию для iPod напрямую." if self.lang == "RU" else "yt-dlp temporary merge failed, but both streams were downloaded. Continuing direct iPod conversion.")
+                    return
 
             if (
                 context.get("kind") in {"audio", "video", "thumbnail"}
@@ -3934,6 +4087,16 @@ class MainWindow(QMainWindow):
             self.show_error("Выбери аудиопоток, а не разделитель.")
             return
         fmt, ext = entry
+        transcode_aac320 = ext == "opus_aac320"
+        if transcode_aac320:
+            if fmt.codec != "Opus":
+                self.show_error("Для AAC 320 из Opus выбери исходный поток Opus." if self.lang == "RU" else "Select an Opus source for AAC 320 conversion.")
+                return
+            ff = ffmpeg_path()
+            if not ff:
+                self.show_error("Для Opus → AAC 320 нужен FFmpeg." if self.lang == "RU" else "Opus → AAC 320 requires FFmpeg.")
+                return
+            ext = ".m4a"
         out = self.ensure_output()
         if not out:
             return
@@ -3957,7 +4120,7 @@ class MainWindow(QMainWindow):
         # or Opus file can never be mistaken for the new download.
         download_dir = out
         temp_dir = None
-        if fragment or ext in {".ogg", ".aac"}:
+        if fragment or transcode_aac320 or ext in {".ogg", ".aac"}:
             temp_dir = Path(tempfile.mkdtemp(prefix="ymd_audio_"))
             download_dir = temp_dir
 
@@ -3973,8 +4136,12 @@ class MainWindow(QMainWindow):
         if overwrite:
             cmd += ["--force-overwrites"]
 
-        # Keep the original selected stream. yt-dlp/ffmpeg only remux where required.
-        if ext in {".opus", ".ogg"}:
+        # Only the explicit iPod mode transcodes. Other modes retain their source codec.
+        if transcode_aac320:
+            cmd += ["--ffmpeg-location", str(ff), "-x", "--audio-format", "m4a",
+                    "--audio-quality", "320K", "--postprocessor-args",
+                    "ExtractAudio+ffmpeg_o:-c:a aac -profile:a aac_low -b:a 320k -ar 44100 -ac 2"]
+        elif ext in {".opus", ".ogg"}:
             cmd += ["-x", "--audio-format", "opus"]
         elif ext == ".m4a":
             cmd += ["-x", "--audio-format", "m4a"]
@@ -4005,6 +4172,7 @@ class MainWindow(QMainWindow):
             cmd,
             {
                 "kind": "audio",
+                "transcode_aac320": transcode_aac320,
                 "output_dir": str(out),
                 "download_dir": str(download_dir),
                 "temp_dir": str(temp_dir) if temp_dir else "",
@@ -4106,6 +4274,8 @@ class MainWindow(QMainWindow):
             return
 
         downloaded = self.move_audio_to_output(ctx, downloaded)
+        if ctx.get("transcode_aac320"):
+            self.write_aac_transcode_comment(downloaded, ctx.get("format"))
         self.audio_chapter_post(ctx, downloaded)
 
     def audio_after_aac(self, ctx: dict, output: Path):
@@ -4119,6 +4289,22 @@ class MainWindow(QMainWindow):
         output = self.move_audio_to_output(ctx, output)
         self.audio_chapter_post(ctx, output)
 
+
+    def write_aac_transcode_comment(self, path: Path, fmt: AudioFormat):
+        if MP4 is None or path.suffix.lower() not in {".m4a", ".mp4"}:
+            self.append_log("Mutagen unavailable — AAC transcode source tag was not written.")
+            return
+        try:
+            source_rate = f"{fmt.abr:g} kbps" if fmt.abr else "unknown bitrate"
+            comment = f"Source audio: Opus {source_rate}; transcoded to AAC 320 kbps"
+            media = MP4(str(path))
+            media["\xa9cmt"] = [comment]
+            media.save()
+            self.append_log(f"[Metadata] {comment}")
+        except Exception as exc:
+            # Tagging is useful metadata, but a failure must never turn a valid
+            # completed audio file into a failed download.
+            self.append_log(f"[Metadata] Could not write AAC transcode source tag: {exc}")
 
     def chapter_rows_for_file(self, path: Path, fragment):
         probe = ffprobe_path()
@@ -4178,14 +4364,14 @@ class MainWindow(QMainWindow):
         video = self.selected_video_entry()
         audio = self.selected_video_audio()
         if not video or not audio:
-            self.show_error("Сначала проанализируй ролик и выбери совместимые видео и аудио.")
+            self.show_error("Сначала проанализируй ролик и выбери видео и аудио." if self.lang == "RU" else "Analyze the video and select video and audio first.")
             return
         out = self.ensure_output()
         if not out:
             return
         ff = ffmpeg_path()
         if not ff:
-            self.show_error("Для объединения видео и аудио нужен FFmpeg.")
+            self.show_error("Для объединения/конвертации видео нужен FFmpeg." if self.lang == "RU" else "FFmpeg is required to merge/convert video.")
             return
         prefix = self.common_download_prefix()
         if prefix is None:
@@ -4195,14 +4381,16 @@ class MainWindow(QMainWindow):
         if fragment is False:
             return
 
-        container = self.selected_container()
-        merge_ext = {"MP4": "mp4", "MKV": "mkv", "WebM": "webm"}[container]
+        ipod_mode = bool(getattr(self, "ipod_compat", None) is not None and self.ipod_compat.isChecked())
+        if ipod_mode and (video.height or 0) > 1080:
+            self.show_error("Для режима iPod Classic 6G исходник ограничен 1080p." if self.lang == "RU" else "iPod Classic 6G mode caps the source at 1080p.")
+            return
 
-        duplicate = self.resolve_duplicate_download(
-            out,
-            "." + merge_ext,
-            fragment,
-        )
+        container = self.selected_container()
+        final_ext = "mp4" if ipod_mode else {"MP4": "mp4", "MKV": "mkv", "WebM": "webm"}[container]
+        merge_ext = "mkv" if ipod_mode else final_ext
+
+        duplicate = self.resolve_duplicate_download(out, "." + final_ext, fragment)
         if duplicate is None:
             return
 
@@ -4211,30 +4399,38 @@ class MainWindow(QMainWindow):
 
         download_dir = out
         temp_dir = None
-        if fragment:
-            temp_dir = Path(tempfile.mkdtemp(prefix="ymd_fragment_"))
+        if fragment or ipod_mode:
+            temp_dir = Path(tempfile.mkdtemp(prefix="ymd_ipod_" if ipod_mode else "ymd_fragment_"))
             download_dir = temp_dir
 
         cmd = prefix + [
             "--newline", "--progress",
             "-f", f"{video.id}+{audio.id}",
             "--merge-output-format", merge_ext,
-            "-o",
-            str(
-                download_dir
-                / f"%(title)s [%(id)s]{name_suffix}.%(ext)s"
-            ),
+            "-o", str(download_dir / f"%(title)s [%(id)s]{name_suffix}.%(ext)s"),
         ]
         if overwrite:
             cmd += ["--force-overwrites"]
-        if self.video_meta.isChecked():
+        if ipod_mode:
+            # Keep the elementary streams. We can convert them directly if yt-dlp's
+            # temporary merger rejects a particular video/audio combination.
+            cmd += ["--keep-video"]
+        if self.video_meta.isChecked() and not ipod_mode:
             cmd += ["--embed-metadata"]
-        if self.video_thumb.isChecked():
+        # Thumbnail embedding is deliberately deferred/omitted in iPod mode: attachments in
+        # the temporary MKV can break strict MP4/iPod stream mapping. Normal mode is unchanged.
+        if self.video_thumb.isChecked() and not ipod_mode:
             cmd += ["--embed-thumbnail"]
-        if self.video_chapters.isChecked() and not self.manual_chapters_text:
+        if self.video_chapters.isChecked() and not self.manual_chapters_text and not ipod_mode:
             cmd += ["--embed-chapters"]
         cmd += [self.url_edit.text().strip()]
 
+        if ipod_mode:
+            self.append_log(
+                "iPod Classic 6G: источник до 1080p → H.264 Baseline ≤640×480/30 fps + AAC-LC 160 kbps."
+                if self.lang == "RU" else
+                "iPod Classic 6G: source up to 1080p → H.264 Baseline ≤640×480/30 fps + AAC-LC 160 kbps."
+            )
         self.status_label.setText("Скачивание видео..." if self.lang == "RU" else "Downloading video...")
         self.start_stream(
             cmd,
@@ -4245,20 +4441,82 @@ class MainWindow(QMainWindow):
                 "temp_dir": str(temp_dir) if temp_dir else "",
                 "started": time.time(),
                 "merge_ext": merge_ext,
+                "final_ext": final_ext,
+                "ipod_mode": ipod_mode,
+                "video_format_id": str(video.id),
+                "audio_format_id": str(audio.id),
                 "fragment": fragment,
                 "name_suffix": name_suffix,
                 "overwrite": overwrite,
             },
         )
 
+    def start_ipod_conversion_from_sources(self, ctx: dict) -> bool:
+        folder = Path(ctx.get("download_dir", ""))
+        if not folder.exists():
+            return False
+        after = float(ctx.get("started", 0.0))
+        video_id = str(ctx.get("video_format_id") or "")
+        audio_id = str(ctx.get("audio_format_id") or "")
+
+        def newest_for_format(fid: str):
+            if not fid:
+                return None
+            matches = []
+            marker = f".f{fid}."
+            for p in folder.iterdir():
+                try:
+                    if p.is_file() and marker in p.name and p.stat().st_mtime >= after - 2:
+                        matches.append(p)
+                except OSError:
+                    pass
+            return max(matches, key=lambda p: p.stat().st_mtime) if matches else None
+
+        video_src = newest_for_format(video_id)
+        audio_src = newest_for_format(audio_id)
+        if not video_src or not audio_src:
+            return False
+
+        ff = ffmpeg_path()
+        if not ff:
+            return False
+        base = re.sub(r"\.f[^.]+$", "", video_src.stem)
+        dest = Path(ctx["output_dir"]) / (base + ".mp4")
+        if dest.exists():
+            dest.unlink()
+        self.status_label.setText("Конвертация для iPod Classic 6G..." if self.lang == "RU" else "Converting for iPod Classic 6G...")
+        self.run_post(
+            "ipod6g",
+            {"ffmpeg": str(ff), "video_input": str(video_src), "audio_input": str(audio_src), "output": str(dest), "duration": float(self.current_info.get("duration") or 0)},
+            next_step=("video_after_ipod", ctx),
+        )
+        return True
+
     def finish_video_download(self, ctx: dict, folder: Path, after: float):
         downloaded = find_latest_file(folder, ["." + ctx["merge_ext"]], after)
         if not downloaded:
-            self.show_error("Не найден скачанный видеофайл.")
+            self.show_error("Не найден скачанный видеофайл." if self.lang == "RU" else "Downloaded video file was not found.")
             self.cleanup_temp(ctx)
             return
 
         out = Path(ctx["output_dir"])
+        if ctx.get("ipod_mode"):
+            ff = ffmpeg_path()
+            if not ff:
+                self.show_error("Для режима iPod Classic 6G нужен FFmpeg." if self.lang == "RU" else "iPod Classic 6G mode requires FFmpeg.")
+                self.cleanup_temp(ctx)
+                return
+            dest = out / (downloaded.stem + ".mp4")
+            if dest.exists():
+                dest.unlink()
+            self.status_label.setText("Конвертация для iPod Classic 6G..." if self.lang == "RU" else "Converting for iPod Classic 6G...")
+            self.run_post(
+                "ipod6g",
+                {"ffmpeg": str(ff), "input": str(downloaded), "output": str(dest), "duration": float(self.current_info.get("duration") or 0)},
+                next_step=("video_after_ipod", ctx),
+            )
+            return
+
         fragment = ctx.get("fragment")
         if fragment:
             ff = ffmpeg_path()
@@ -4334,6 +4592,21 @@ class MainWindow(QMainWindow):
             self.audio_after_aac(ctx, p)
         elif name == "video_after_fragment":
             self.video_after_fragment(ctx, p)
+        elif name == "video_after_ipod":
+            # If a fragment was requested, cut it after the compatibility transcode.
+            fragment = ctx.get("fragment")
+            if fragment:
+                ff = ffmpeg_path()
+                start_ms, to_ms = fragment
+                dest = Path(ctx["output_dir"]) / (p.stem + f" [{self.fragment_filename_stamp()}]" + p.suffix)
+                self.run_post(
+                    "fragment",
+                    {"ffmpeg": str(ff), "input": str(p), "output": str(dest),
+                     "start": start_ms / 1000, "duration": (to_ms - start_ms) / 1000},
+                    next_step=("video_after_fragment", ctx),
+                )
+            else:
+                self.video_after_fragment(ctx, p)
         elif name == "split_complete":
             src = Path(ctx.get("source", ""))
             if src.exists():

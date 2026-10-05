@@ -1,4 +1,23 @@
-# YouTube Media Downloader v2.0.0-alpha31 — Python / PySide6
+
+## v2.0.0-alpha36
+
+### alpha36 — FFmpeg ASCII progress for iPod conversion
+- Added an ASCII conversion progress bar to the event log for iPod Classic 6G transcodes.
+- The top progress bar now follows FFmpeg conversion progress as well as downloading.
+- Conversion log shows percentage, elapsed/output timestamp, total duration and FFmpeg speed when available.
+
+- Общий прогресс скачивания перенесён в верхнюю карточку рядом с папкой сохранения.
+- В режиме iPod Classic 6G временные video/audio потоки сохраняются отдельно.
+- Если yt-dlp не может объединить, например, HLS MP4 + WebM/Opus во временный MKV, программа больше не обрывает задачу: она передаёт оба скачанных потока напрямую FFmpeg и делает финальный iPod MP4.
+- Временное встраивание metadata/chapters для iPod-ветки отключено до финальной конвертации, чтобы не ломать промежуточный merge.
+
+
+- iPod Classic 6G checkbox is now a conversion preset instead of a direct-stream filter.
+- Source video choices remain available up to 1080p; 1440p/4K are intentionally hidden in iPod mode.
+- Final iPod file: MP4, H.264 Baseline Level 3.0, up to 640×480, up to 30 fps, AAC-LC 160 kbps / 48 kHz stereo.
+- VP9/AV1/H.264 source streams are accepted and transcoded automatically.
+
+# YouTube Media Downloader v2.0.0-alpha33 — Python / PySide6
 
 Первая кроссплатформенная миграция PowerShell/WinForms-версии.
 
@@ -628,7 +647,7 @@ Cookies могут давать доступ к аккаунту, не пере�
 - Предыдущие функции и исправления alpha27 сохранены.
 
 
-## Изменения alpha31 — форматы аудио и пояснения
+## Изменения alpha32 — форматы аудио и пояснения
 
 - При временном выборе AAC/ADTS запоминаются галочки метаданных и обложки. Возврат к M4A/Opus/OGG восстанавливает именно прежний выбор, включая снятые пользователем галочки.
 - Выбор встраивания глав запоминается: в несовместимом формате временно выключен и восстанавливается при возврате к M4A, если пользователь не выбрал другой режим.
@@ -636,3 +655,9 @@ Cookies могут давать доступ к аккаунту, не пере�
 - Добавлены компактные значки ⓘ рядом с полями и разделами. Наведение — подсказка с прежней задержкой 2.5 секунды; нажатие — сразу.
 - Короткие пояснения рассказывают про ограничения AAC/ADTS, глав, совместимость контейнеров и кодеков, выбор потоков и причины недоступных операций. Русский/английский текст соответствует языку интерфейса.
 - Изменения alpha28 сохранены.
+
+
+## Изменения alpha33 — iPod Classic 6G / AAC metadata / M4A chapters
+- Добавлен фильтр видео «Только совместимое с iPod Classic 6G»: MP4 + H.264 Baseline до 640×480, 30 fps, 2.5 Mbps и AAC-LC до 160 kbps.
+- В режиме Opus → AAC 320 в M4A автоматически записывается английский Comment с фактическим битрейтом исходного Opus: `Source audio: Opus X kbps; transcoded to AAC 320 kbps`.
+- Исправлено ложное падение FFmpeg при встраивании глав в M4A с thumbnail: служебные text/data streams больше не копируются при chapter-remux. Готовый файл не считается испорченным из-за этой постобработки.

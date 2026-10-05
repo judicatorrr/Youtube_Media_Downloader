@@ -148,7 +148,12 @@ def embed_chapters_copy(ffmpeg: Path, input_path: Path, chapters: list[Chapter])
             "-hide_banner", "-loglevel", "error", "-y",
             "-i", str(input_path),
             "-i", str(meta),
-            "-map", "0",
+            # Audio files may contain an attached cover plus auxiliary text/data
+            # streams created by metadata post-processors. MP4/M4A rejects some
+            # of those streams (for example codec tag 'text'). Keep the actual
+            # audio and optional cover art, but deliberately drop data/subtitles.
+            "-map", "0:a:0",
+            "-map", "0:v?",
             "-map_metadata", "0",
             "-map_chapters", "1",
             "-c", "copy",

@@ -598,6 +598,50 @@ def audio_container_compatible(fmt, container: str) -> bool:
     return fmt.codec in ({"AAC"} if container == "MP4" else {"Opus"} if container == "WebM" else {"AAC", "Opus"})
 
 
+def ipod_classic_6g_video_compatible(fmt) -> bool:
+    """Conservative direct-play filter for iPod classic 6G/120GB-era video.
+
+    Apple specifies H.264 Baseline up to Level 3.0, 640x480, 30 fps and
+    up to 2.5 Mbps. YouTube AVC codec strings normally expose profile/level
+    as avc1.PPCCLL, so reject clearly non-Baseline streams.
+    """
+    if fmt.codec != "H.264":
+        return False
+    if fmt.width and fmt.width > 640:
+        return False
+    if fmt.height and fmt.height > 480:
+        return False
+    if fmt.fps and fmt.fps > 30.01:
+        return False
+    if fmt.tbr and fmt.tbr > 2500:
+        return False
+
+    raw = (fmt.vcodec or "").lower()
+    m = re.search(r"avc1\.([0-9a-f]{6})", raw)
+    if m:
+        profile_idc = int(m.group(1)[0:2], 16)
+        level_idc = int(m.group(1)[4:6], 16)
+        if profile_idc != 0x42:  # Baseline profile
+            return False
+        if level_idc > 30:      # Level 3.0
+            return False
+    return True
+
+
+def ipod_classic_6g_audio_compatible(fmt) -> bool:
+    """AAC-LC, <=160 kbps, <=48 kHz, stereo-compatible YouTube audio."""
+    if fmt.codec != "AAC":
+        return False
+    raw = (fmt.acodec or "").lower()
+    if raw and not ("mp4a.40.2" in raw or raw in {"aac", "aaclc", "aac-lc"}):
+        return False
+    if fmt.abr and fmt.abr > 160:
+        return False
+    if fmt.asr and fmt.asr > 48000:
+        return False
+    return True
+
+
 def container_has_4k(videos, audios, container: str) -> bool:
     return any(audio_container_compatible(a, container) for a in audios) and any(
         video_container_compatible(v, container) and (min(v.width, v.height) if v.width and v.height else v.height) >= 2160
